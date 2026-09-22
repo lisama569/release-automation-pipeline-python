@@ -1,0 +1,40 @@
+# 发布流水线构建矩阵示例。
+# - name:    目标名（需与分阶段计划中的 canary / partial-a / partial-b / full 对应）
+# - command: 构建命令：
+#     sim:ok                 本地确定性模拟构建（无需外部服务）
+#       options.health: ok | fail | ambiguous | inconsistent
+#     sim:fail:build|package 确定性失败，用于演练部分失败与回滚
+#     cmd:-- <argv...>       执行真实命令（须在工作目录写出 payload，可附 health.json）
+# - inputs:  影响产物的输入文件/目录（相对仓库根），全部进入缓存键；缺失即失败
+
+[[targets]]
+name = "canary"
+command = "sim:ok"
+inputs = ["release_pipeline", "pyproject.toml"]
+
+[targets.options]
+health = "ok"
+
+[[targets]]
+name = "partial-a"
+command = "sim:ok"
+inputs = ["release_pipeline", "pyproject.toml"]
+
+[targets.options]
+health = "ok"
+
+[[targets]]
+name = "partial-b"
+command = "sim:ok"
+inputs = ["release_pipeline", "pyproject.toml"]
+
+[targets.options]
+health = "ok"
+
+[[targets]]
+name = "full"
+command = "sim:ok"
+inputs = ["release_pipeline", "pyproject.toml"]
+
+[targets.options]
+health = "ok"

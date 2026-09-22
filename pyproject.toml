@@ -6,6 +6,26 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
 
+[project.scripts]
+release-pipeline = "release_pipeline.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+log_cli = false
+
+[tool.hatch.build.targets.wheel]
+packages = ["release_pipeline"]
+
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
