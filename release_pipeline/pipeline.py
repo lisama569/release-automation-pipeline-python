@@ -1,0 +1,203 @@
+"""End-to-end orchestration: version -> build matrix -> staged rollout.
+
+Determinism
+-----------
+The orchestration layer adds no nondeterminism: no wall-clock fields, and
+every external influence (environment, config, health policy) is passed
+explicitly via :class:`PipelineConfig`. Running the same config twice in
+``local`` mode and twice in ``ci`` mode yields identical versions, identical
+cache decisions and identical verdicts.
+
+Exit codes
+----------
+0  all targets built and every configured stage advanced
+2  one or more build targets failed (other targets may still be deployed)
+3  a rollout stage was blocked and rolled back
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .builder import (
+    fingerprint_config,
+    fingerprint_environment,
+    hash_source_tree,
+    run_matrix,
+)
+from .cache import BuildCache
+from .deploy import SimulatedEnvironment, rollout
+from .models import (
+    BuildReport,
+    BuildTarget,
+    DeployResult,
+    HealthVerdict,
+    RolloutStage,
+    VersionInfo,
+)
+from .log import log
+from .parity import check_parity
+from .state import ReleaseStateStore
+from .versioning import derive_version
+
+EXIT_OK = 0
+EXIT_BUILD_FAILED = 2
+EXIT_ROLLOUT_BLOCKED = 3
+
+
+@dataclass
+class PipelineConfig:
+    repo_dir: str = "."
+    work_dir: str = ".release-work"
+    targets: tuple[str, ...] = ("linux-x86_64", "linux-aarch64")
+    failing_targets: frozenset[str] = field(default_factory=frozenset)
+    declared_version: str | None = None
+    env: dict[str, str] | None = None
+    config: dict[str, object] | None = None
+    mode: str = "local"
+    stages: tuple[str, ...] = ("staging", "canary", "full")
+    # stage name -> (healthy, conclusive); absent stages default to healthy.
+    health_policy: dict[str, tuple[bool, bool]] = field(default_factory=dict)
+    extra_params: frozenset[str] = field(default_factory=frozenset)
+
+
+@dataclass
+class PipelineResult:
+    version: VersionInfo
+    build: BuildReport
+    deploys: tuple[DeployResult, ...]
+    exit_code: int
+    summary: str
+    degraded: str = ""
+
+
+def _build_targets(cfg: PipelineConfig) -> list[BuildTarget]:
+    targets: list[BuildTarget] = []
+    for i, name in enumerate(cfg.targets):
+        targets.append(
+            BuildTarget(
+                name=name,
+                artifact_name=f"app-{i}-{name}.bin",
+                fail=name in cfg.failing_targets,
+            )
+        )
+    return targets
+
+
+def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
+    """Execute the full pipeline deterministically and return a result.
+
+    The function never raises for expected build/deploy failures; they are
+    encoded in the result and the exit code.
+    """
+    parity = check_parity(
+        mode=cfg.mode,
+        env=cfg.env,
+        given_params=cfg.extra_params,
+    )
+
+    work = Path(cfg.work_dir)
+    cache_dir = work / "cache"
+    artifacts_root = work / "artifacts"
+    state_dir = work / "state"
+    env_root = work / "environments"
+    for p in (cache_dir, artifacts_root, state_dir, env_root):
+        p.mkdir(parents=True, exist_ok=True)
+
+    version = derive_version(cfg.repo_dir, declared=cfg.declared_version)
+    log(
+        "pipeline",
+        "derived version",
+        version=version.version,
+        source=version.source,
+        dirty=version.dirty,
+        hash=version.reproducible_hash,
+    )
+
+    cache = BuildCache(cache_dir)
+    env_fp = fingerprint_environment(cfg.env)
+    cfg_fp = fingerprint_config(cfg.config or {})
+    src_hash = hash_source_tree(cfg.repo_dir)
+    log(
+        "pipeline",
+        "fingerprints",
+        src=src_hash[:12],
+        env=env_fp[:12],
+        cfg=cfg_fp[:12],
+    )
+
+    report = run_matrix(
+        _build_targets(cfg),
+        version,
+        cache,
+        str(artifacts_root),
+        env_fingerprint=env_fp,
+        config_fingerprint=cfg_fp,
+        source_hash=src_hash,
+    )
+
+    # Only successful, verified artifacts may be deployed. Each target has
+    # its own simulated environment and its own state file.
+    deploys: list[DeployResult] = []
+    deploy_blocked = False
+    for result in report.results:
+        target_name = result.target
+        if result.artifact is None:
+            log(
+                "pipeline",
+                "skip deploy: no usable artifact",
+                target=target_name,
+                reason=result.reason,
+            )
+            continue
+        store = ReleaseStateStore(state_dir / target_name)
+        env = SimulatedEnvironment(
+            env_root / target_name,
+            health_by_stage=dict(cfg.health_policy),
+        )
+        # Advance through exactly the configured number of stages.
+        chain = [RolloutStage.NONE] + [RolloutStage(s) for s in cfg.stages]
+        current = _current_stage(store)
+        while current in chain and current != chain[-1]:
+            dr = rollout(env, result.artifact, version.version, store)
+            deploys.append(dr)
+            if dr.rolled_back:
+                deploy_blocked = True
+                break
+            current = dr.stage
+
+    exit_code = EXIT_OK
+    if report.failed:
+        exit_code = EXIT_BUILD_FAILED
+    if deploy_blocked and exit_code == EXIT_OK:
+        exit_code = EXIT_ROLLOUT_BLOCKED
+    elif deploy_blocked:
+        # Partial build failure and rollout failure are both reportable;
+        # build failure keeps its dedicated code, rollout is in the summary.
+        exit_code = EXIT_BUILD_FAILED
+
+    parts = [
+        f"version={version.version}",
+        f"builds={len(report.succeeded)}/{len(report.results)}",
+        f"failed_targets={[r.target for r in report.failed]}",
+        f"rollbacks={[d.version + '@' + d.stage.value for d in deploys if d.rolled_back]}",
+        f"exit={exit_code}",
+    ]
+    summary = " ".join(parts)
+    log("pipeline", f"{summary}")
+    return PipelineResult(
+        version=version,
+        build=report,
+        deploys=tuple(deploys),
+        exit_code=exit_code,
+        summary=summary,
+        degraded=parity.get("degraded", ""),
+    )
+
+
+def _current_stage(store: ReleaseStateStore) -> RolloutStage:
+    state = store.read()
+    if not state:
+        return RolloutStage.NONE
+    return RolloutStage(state.get("stage", RolloutStage.NONE.value))
