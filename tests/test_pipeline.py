@@ -45,18 +45,20 @@ def test_happy_path_exit_zero_and_idempotent_rerun(tmp_path, git_repo):
 def test_partial_build_failure_exit_2_but_others_live(tmp_path, git_repo):
     cfg = _cfg(
         tmp_path / "w", repo=str(git_repo),
-        targets=("t1", "t2"), failing_targets=frozenset({"t2"}),
+        targets=("linux-x86_64", "linux-aarch64"),
+        failing_targets=frozenset({"linux-aarch64"}),
     )
     r = run_pipeline(cfg)
     failed = [x.target for x in r.build.failed]
     succeeded = [x.target for x in r.build.succeeded]
-    print(f"\n[test input] failing={{t2}} -> failed={failed} succeeded={succeeded} "
-          f"exit={r.exit_code}")
+    print(f"\n[test input] failing={{linux-aarch64}} -> failed={failed} "
+          f"succeeded={succeeded} exit={r.exit_code}")
     assert r.exit_code == EXIT_BUILD_FAILED
-    assert failed == ["t2"] and succeeded == ["t1"]
-    # t1 artifact deployed through all stages; t2 has neither artifact nor env.
-    assert (tmp_path / "w" / "environments" / "t1" / "current").exists()
-    assert not (tmp_path / "w" / "environments" / "t2").exists()
+    assert failed == ["linux-aarch64"] and succeeded == ["linux-x86_64"]
+    # linux-x86_64 artifact deployed through all stages; linux-aarch64 has
+    # neither artifact nor env.
+    assert (tmp_path / "w" / "environments" / "linux-x86_64" / "current").exists()
+    assert not (tmp_path / "w" / "environments" / "linux-aarch64").exists()
     assert not [d for d in r.deploys if d.rolled_back]
 
 
@@ -134,13 +136,13 @@ def test_repeated_runs_share_cache_artifacts_byte_identical(tmp_path, git_repo):
 def test_crash_leftovers_are_swept_on_retry(tmp_path, git_repo):
     work = tmp_path / "w"
     # Simulate interrupted deploy leaving staging/temp symlinks behind.
-    env_root = work / "environments" / "t1" / "releases"
+    env_root = work / "environments" / "linux-x86_64" / "releases"
     env_root.mkdir(parents=True)
     (env_root / ".staging-deadbeef").mkdir()
-    (work / "environments" / "t1").mkdir(parents=True, exist_ok=True)
-    (work / "environments" / "t1" / ".current.tmp-abcd").symlink_to(
+    (work / "environments" / "linux-x86_64").mkdir(parents=True, exist_ok=True)
+    (work / "environments" / "linux-x86_64" / ".current.tmp-abcd").symlink_to(
         "releases/x")
-    r = run_pipeline(_cfg(work, str(git_repo), targets=("t1",)))
+    r = run_pipeline(_cfg(work, str(git_repo), targets=("linux-x86_64",)))
     leftovers = list((work / "environments").rglob(".staging-*"))
     leftovers += list((work / "environments").rglob(".current.tmp-*"))
     print(f"\n[test input] stale temp resources present -> exit={r.exit_code}, "
@@ -158,7 +160,7 @@ def test_concurrent_pipeline_runs_no_half_state(tmp_path, git_repo):
     def runner():
         try:
             r = run_pipeline(_cfg(tmp_path / "w", str(git_repo),
-                                  targets=("t1",)))
+                                  targets=("linux-x86_64",)))
             results.append(r.exit_code)
         except Exception as exc:
             errors.append(exc)
@@ -172,7 +174,7 @@ def test_concurrent_pipeline_runs_no_half_state(tmp_path, git_repo):
           f"errors={errors}")
     assert not errors
     assert results == [EXIT_OK, EXIT_OK, EXIT_OK]
-    state = json.loads((tmp_path / "w" / "state" / "t1" / "state.json")
+    state = json.loads((tmp_path / "w" / "state" / "linux-x86_64" / "state.json")
                        .read_text())
     assert state["stage"] == "full"
     assert state["rolled_back"] is False

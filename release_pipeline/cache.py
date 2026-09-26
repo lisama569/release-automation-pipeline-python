@@ -71,6 +71,68 @@ class CacheMiss(Exception):
     """Internal: no usable entry (absent or corrupted/rebuilt)."""
 
 
+# Result codes of the strictly read-only cache probe used by the preview.
+PROBE_HIT = "hit"
+PROBE_MISS = "miss"
+PROBE_CORRUPT = "corrupt"
+
+
+def probe_entry(cache_dir: str | Path, inp: BuildInput) -> str:
+    """Read-only cache inspection for dry-runs.
+
+    Returns :data:`PROBE_HIT`, :data:`PROBE_MISS` or :data:`PROBE_CORRUPT`.
+    Unlike :meth:`BuildCache.get`/``verify`` this never creates directories,
+    never locks and never evicts a corrupt entry: a preview through this
+    function provably leaves the cache byte-for-byte unchanged. A corrupt
+    entry still maps to ``rebuild`` for the caller, exactly matching what the
+    real execution would do (get -> evict -> rebuild).
+    """
+    key = compute_cache_key(inp)
+    root = Path(cache_dir)
+    meta_path = root / key[:2] / key / _META_NAME
+    art_path = root / key[:2] / key / _ARTIFACT_NAME
+    if not meta_path.is_file() or not art_path.is_file():
+        return PROBE_MISS
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        with open(art_path, "rb") as fh:
+            data = fh.read()
+    except (OSError, json.JSONDecodeError):
+        return PROBE_CORRUPT
+    expected_fields = {
+        "format": CACHE_FORMAT_VERSION,
+        "target": inp.target.name,
+        "version": inp.version,
+        "source_hash": inp.source_hash,
+        "env_fingerprint": inp.env_fingerprint,
+        "config_fingerprint": inp.config_fingerprint,
+        "toolchain": inp.toolchain,
+    }
+    for field_name, expected in expected_fields.items():
+        if meta.get(field_name) != expected:
+            return PROBE_CORRUPT
+    if meta.get("content_hash") != _sha256_bytes(data):
+        return PROBE_CORRUPT
+    return PROBE_HIT
+
+
+def read_meta_content_hash(cache_dir: str | Path, inp: BuildInput) -> str:
+    """Read the recorded content hash for ``inp`` without any writes.
+
+    Returns "" when no intact entry exists.
+    """
+    if probe_entry(cache_dir, inp) != PROBE_HIT:
+        return ""
+    key = compute_cache_key(inp)
+    meta_path = Path(cache_dir) / key[:2] / key / _META_NAME
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            return str(json.load(fh).get("content_hash", ""))
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
 class BuildCache:
     """On-disk cache of artifacts keyed by :func:`compute_cache_key`."""
 

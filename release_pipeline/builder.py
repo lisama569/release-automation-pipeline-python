@@ -128,6 +128,15 @@ def _produce_artifact_bytes(target: BuildTarget, version: VersionInfo) -> bytes:
     return payload
 
 
+def planned_content_hash(target: BuildTarget, version: VersionInfo) -> str:
+    """SHA-256 of the artifact a build would produce, without building.
+
+    Pure function of the same inputs as :func:`_produce_artifact_bytes`, so
+    a dry-run can state exactly which content hash a rebuild would publish.
+    """
+    return hashlib.sha256(_produce_artifact_bytes(target, version)).hexdigest()
+
+
 def build_one(
     target: BuildTarget,
     version: VersionInfo,

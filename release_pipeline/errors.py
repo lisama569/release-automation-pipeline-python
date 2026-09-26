@@ -68,3 +68,14 @@ class StateError(PipelineError):
     """Persistent release state is missing, locked or inconsistent."""
 
     code = "state_error"
+
+
+class ContractViolationError(PipelineError):
+    """A request violates the execution contract (empty targets, illegal
+    stage sequence, unknown target/stage, ...).
+
+    Raised before any state is touched; the ``code`` distinguishes the exact
+    violation so callers can react mechanically.
+    """
+
+    code = "contract_violation"

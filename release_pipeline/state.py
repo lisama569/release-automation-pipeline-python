@@ -41,6 +41,31 @@ def new_state(version: str) -> dict:
     }
 
 
+def read_state_readonly(state_dir: str | Path) -> dict:
+    """Read ``state.json`` without creating anything (dry-run safe).
+
+    Returns an empty dict when no state file exists. Raises
+    :class:`StateError` on corrupted content — the same failure the real
+    execution would hit, so preview and execution stay consistent. The file
+    is written atomically by :class:`ReleaseStateStore`, so a plain read
+    always observes a complete snapshot.
+    """
+    path = Path(state_dir) / STATE_FILE
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(
+            f"state file unreadable: {exc}", code="state_corrupted"
+        ) from exc
+    if not isinstance(data, dict):
+        raise StateError("state file is not a JSON object",
+                         code="state_corrupted")
+    return data
+
+
 class ReleaseStateStore:
     """JSON state file guarded by an exclusive advisory lock."""
 

@@ -35,10 +35,11 @@ def test_version_outputs_json(tmp_path, git_repo):
 def test_run_exit_codes(tmp_path, git_repo):
     code, out, _ = run_cli(
         "run", "--repo", str(git_repo), "--work-dir", str(tmp_path / "w"),
-        "--targets", "t1,t2", "--fail", "t2",
+        "--targets", "linux-x86_64,linux-aarch64", "--fail", "linux-aarch64",
     )
     payload = json.loads(out)
-    print(f"\n[test input] --fail t2 -> exit={code}, summary={payload['summary']}")
+    print(f"\n[test input] --fail linux-aarch64 -> exit={code}, "
+          f"summary={payload['summary']}")
     assert code == 2
     assert payload["exit_code"] == 2
 

@@ -31,6 +31,7 @@ from .models import (
     HealthVerdict,
     RolloutStage,
 )
+from .planner import health_verdict_for
 from .state import ReleaseStateStore, new_state
 
 NEXT_STAGE: dict[RolloutStage, RolloutStage] = {
@@ -137,20 +138,11 @@ class SimulatedEnvironment:
 
     # ---------------------------------------------------------------- health
     def check_health(self, stage: RolloutStage) -> HealthVerdict:
-        if self.visible_version is None:
-            # Nothing live yet -> cannot be healthy, and that IS conclusive.
-            return HealthVerdict(
-                healthy=False,
-                conclusive=True,
-                detail="no release visible",
-            )
-        healthy, conclusive = self._policy.get(stage.value, self._default)
-        if not conclusive:
-            detail = f"health inconclusive at stage {stage.value}"
-        elif healthy:
-            detail = f"health checks passed at stage {stage.value}"
-        else:
-            detail = f"health checks FAILED at stage {stage.value}"
+        # Decision logic is shared with the preview path so verdicts can never
+        # differ; this wrapper only supplies the live visibility observation.
+        healthy, conclusive, detail = health_verdict_for(
+            stage, self._policy, visible=self.visible_version is not None
+        )
         return HealthVerdict(
             healthy=healthy, conclusive=conclusive, detail=detail
         )

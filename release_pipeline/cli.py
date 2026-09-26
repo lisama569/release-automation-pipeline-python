@@ -77,6 +77,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra pipeline parameters (validated; rejected in ci mode)",
     )
 
+    pd = sub.add_parser(
+        "preview",
+        help="dry-run: machine-readable conclusion, zero filesystem trace",
+    )
+    add_common(pd)
+    pd.add_argument("--targets", default="linux-x86_64,linux-aarch64")
+    pd.add_argument("--fail", default="")
+    pd.add_argument("--env-file", default=None)
+    pd.add_argument("--config-file", default=None)
+    pd.add_argument("--stages", default="staging,canary,full")
+    pd.add_argument("--health-file", default=None)
+    pd.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+    )
+
+    prv = sub.add_parser(
+        "record-verify",
+        help="check a release record against the artifacts on disk",
+    )
+    prv.add_argument("--work-dir", default=".release-work")
+    prv.add_argument("record", help="path to the record JSON file")
+
+    prc = sub.add_parser(
+        "record-compare",
+        help="diff two release records, field by field",
+    )
+    prc.add_argument("record_a")
+    prc.add_argument("record_b")
+
     pp = sub.add_parser("verify-parity", help="check local/CI parity contract")
     pp.add_argument("--mode", choices=("local", "ci"), default="local")
     pp.add_argument("--env-file", default=None)
@@ -218,8 +251,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(
                 {
                     "exit_code": result.exit_code,
+                    "outcome": result.outcome,
                     "summary": result.summary,
                     "degraded": result.degraded,
+                    "record_id": result.record_id,
+                    "record_path": result.record_path,
                     "deploy": [
                         {
                             "version": d.version,
@@ -235,6 +271,84 @@ def main(argv: list[str] | None = None) -> int:
                 indent=2,
             ))
             return result.exit_code
+
+        if args.command == "preview":
+            from .preview import preview_pipeline
+
+            cfg = PipelineConfig(
+                repo_dir=args.repo,
+                work_dir=args.work_dir,
+                targets=_split_csv(args.targets),
+                failing_targets=frozenset(_split_csv(args.fail)),
+                declared_version=args.declared_version,
+                env=env,
+                config=config,
+                mode=args.mode,
+                stages=_split_csv(args.stages),
+                health_policy=health_policy,
+                extra_params=extra,
+            )
+            result = preview_pipeline(cfg)
+            print(json.dumps(
+                {
+                    "version": result.version,
+                    "reproducible_hash": result.reproducible_hash,
+                    "predicted_exit_code": result.predicted_exit_code,
+                    "outcome": result.outcome,
+                    "summary": result.summary,
+                    "builds": [
+                        {
+                            "target": b.target,
+                            "action": b.action,
+                            "reason": b.reason,
+                            "cache_key": b.cache_key,
+                            "content_hash": b.content_hash,
+                        }
+                        for b in result.builds
+                    ],
+                    "deploys": [
+                        {
+                            "target": d.target,
+                            "current_stage": d.current_stage,
+                            "planned_stages": list(d.planned_stages),
+                            "final_stage": d.final_stage,
+                            "blocked_at": d.blocked_at,
+                            "blocked_reason": d.blocked_reason,
+                        }
+                        for d in result.deploys
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ))
+            # A preview is a successful inspection even when it predicts a
+            # failing execution; the prediction lives in the payload.
+            return 0
+
+        if args.command == "record-verify":
+            from .record import load_record, verify_record
+
+            record = load_record(args.record)
+            mismatches = verify_record(record, args.work_dir)
+            print(json.dumps(
+                {"record_id": record["id"], "mismatches": list(mismatches)},
+                ensure_ascii=False,
+                indent=2,
+            ))
+            return 0 if not mismatches else 4
+
+        if args.command == "record-compare":
+            from .record import compare_records, load_record
+
+            diff = compare_records(
+                load_record(args.record_a), load_record(args.record_b)
+            )
+            print(json.dumps(
+                {"equal": diff.equal, "changes": list(diff.changes)},
+                ensure_ascii=False,
+                indent=2,
+            ))
+            return 0 if diff.equal else 4
 
         parser.error(f"unknown command {args.command!r}")
         return 2
