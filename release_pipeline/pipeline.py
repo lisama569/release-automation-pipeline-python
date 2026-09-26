@@ -11,8 +11,9 @@ cache decisions and identical verdicts.
 Exit codes
 ----------
 0  all targets built and every configured stage advanced
-2  one or more build targets failed (other targets may still be deployed)
+2  some (but not all) build targets failed (others may still be deployed)
 3  a rollout stage was blocked and rolled back
+4  every requested build target failed
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from .builder import (
     run_matrix,
 )
 from .cache import BuildCache
-from .deploy import SimulatedEnvironment, rollout
+from .deploy import SimulatedEnvironment, rollout, visible_version_readonly
 from .models import (
     BuildReport,
     BuildTarget,
@@ -38,12 +39,15 @@ from .models import (
 )
 from .log import log
 from .parity import check_parity
-from .state import ReleaseStateStore
+from .record import build_record, write_record
+from .state import ReleaseStateStore, read_state_readonly
+from .validate import validate_config
 from .versioning import derive_version
 
 EXIT_OK = 0
 EXIT_BUILD_FAILED = 2
 EXIT_ROLLOUT_BLOCKED = 3
+EXIT_BUILD_FAILED_ALL = 4
 
 
 @dataclass
@@ -70,6 +74,12 @@ class PipelineResult:
     exit_code: int
     summary: str
     degraded: str = ""
+    # "none" | "partial" | "all": keeps total build failure machine-
+    # distinguishable from a partial one instead of merging both into
+    # a single "failed" conclusion.
+    failure_kind: str = "none"
+    # Machine-readable, byte-deterministic receipt of this real run.
+    record: dict = field(default_factory=dict)
 
 
 def _build_targets(cfg: PipelineConfig) -> list[BuildTarget]:
@@ -89,8 +99,11 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     """Execute the full pipeline deterministically and return a result.
 
     The function never raises for expected build/deploy failures; they are
-    encoded in the result and the exit code.
+    encoded in the result and the exit code. Contract-violating requests
+    (empty targets, unknown targets/stages, non-monotonic stage sequences)
+    are rejected by :func:`validate_config` *before* any side effect.
     """
+    validate_config(cfg)
     parity = check_parity(
         mode=cfg.mode,
         env=cfg.env,
@@ -167,25 +180,69 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                 break
             current = dr.stage
 
+    # Distinguish "every target failed" from "some targets failed"; the two
+    # must never collapse into one conclusion.
+    if not report.failed:
+        failure_kind = "none"
+    elif len(report.failed) == len(report.results):
+        failure_kind = "all"
+    else:
+        failure_kind = "partial"
+
     exit_code = EXIT_OK
-    if report.failed:
+    if failure_kind == "all":
+        exit_code = EXIT_BUILD_FAILED_ALL
+    elif failure_kind == "partial":
         exit_code = EXIT_BUILD_FAILED
     if deploy_blocked and exit_code == EXIT_OK:
         exit_code = EXIT_ROLLOUT_BLOCKED
-    elif deploy_blocked:
-        # Partial build failure and rollout failure are both reportable;
-        # build failure keeps its dedicated code, rollout is in the summary.
-        exit_code = EXIT_BUILD_FAILED
+    # Partial/total build failure and rollout failure are both reportable;
+    # build failure keeps its dedicated code, rollout is in the summary.
 
     parts = [
         f"version={version.version}",
         f"builds={len(report.succeeded)}/{len(report.results)}",
+        f"failure_kind={failure_kind}",
         f"failed_targets={[r.target for r in report.failed]}",
         f"rollbacks={[d.version + '@' + d.stage.value for d in deploys if d.rolled_back]}",
         f"exit={exit_code}",
     ]
     summary = " ".join(parts)
     log("pipeline", f"{summary}")
+
+    # Collect the final per-target stage state via read-only probes (no
+    # directories, locks or symlinks are created by these reads), then emit
+    # the deterministic release record for this real execution.
+    final_states: list[dict] = []
+    for name in cfg.targets:
+        state = read_state_readonly(state_dir / name)
+        visible = visible_version_readonly(env_root / name)
+        final_states.append(
+            {
+                "target": name,
+                "final_stage": state.get("stage", RolloutStage.NONE.value),
+                "rolled_back": bool(state.get("rolled_back", False)),
+                "visible_version": visible,
+            }
+        )
+    record = build_record(
+        version=version,
+        targets=cfg.targets,
+        stages=cfg.stages,
+        failing_targets=cfg.failing_targets,
+        health_policy=cfg.health_policy,
+        env_fingerprint=env_fp,
+        config_fingerprint=cfg_fp,
+        source_hash=src_hash,
+        build=report,
+        final_states=tuple(final_states),
+        exit_code=exit_code,
+        failure_kind=failure_kind,
+        deploy_blocked=deploy_blocked,
+    )
+    write_record(record, work / "records")
+    log("pipeline", "release record written", targets=len(cfg.targets))
+
     return PipelineResult(
         version=version,
         build=report,
@@ -193,6 +250,8 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         exit_code=exit_code,
         summary=summary,
         degraded=parity.get("degraded", ""),
+        failure_kind=failure_kind,
+        record=record,
     )
 
 

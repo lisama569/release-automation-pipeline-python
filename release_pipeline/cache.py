@@ -71,6 +71,46 @@ class CacheMiss(Exception):
     """Internal: no usable entry (absent or corrupted/rebuilt)."""
 
 
+def probe_cache_entry(cache_dir: str | Path, inp: BuildInput) -> str:
+    """Read-only cache probe: ``"hit" | "miss" | "corrupted"``.
+
+    Unlike :meth:`BuildCache.get`, this never creates the cache directory,
+    never takes a lock and **never evicts** a corrupted entry, so dry-run
+    planning can predict reuse-vs-rebuild with zero side effects even while a
+    real run shares the cache.
+    """
+    key = compute_cache_key(inp)
+    root = Path(cache_dir)
+    entry = root / key[:2] / key
+    meta_path = entry / _META_NAME
+    art_path = entry / _ARTIFACT_NAME
+    if not meta_path.is_file() or not art_path.is_file():
+        return "miss"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        with open(art_path, "rb") as fh:
+            data = fh.read()
+    except (OSError, json.JSONDecodeError):
+        return "corrupted"
+
+    expected_fields = {
+        "format": CACHE_FORMAT_VERSION,
+        "target": inp.target.name,
+        "version": inp.version,
+        "source_hash": inp.source_hash,
+        "env_fingerprint": inp.env_fingerprint,
+        "config_fingerprint": inp.config_fingerprint,
+        "toolchain": inp.toolchain,
+    }
+    for field_name, expected in expected_fields.items():
+        if meta.get(field_name) != expected:
+            return "corrupted"
+    if meta.get("content_hash") != _sha256_bytes(data):
+        return "corrupted"
+    return "hit"
+
+
 class BuildCache:
     """On-disk cache of artifacts keyed by :func:`compute_cache_key`."""
 

@@ -7,7 +7,9 @@
 3. **内容寻址构建缓存**：键覆盖全部产物相关输入，损坏自动降级重建；
 4. **分阶段上线与自动回滚**：本地模拟目标环境，健康不明绝不推进；
 5. **本地 / CI 一致性**：两种执行路径结论一致，差异显式拒绝或降级；
-6. **并发与重试安全**：文件锁 + 原子写 + 临时资源清理。
+6. **并发与重试安全**：文件锁 + 原子写 + 临时资源清理；
+7. **预演（dry-run）**：执行前给出机器可读预测，全程零痕迹；
+8. **发布记录**：每次真实执行产出确定性、可比较、可校验的机器可读记录。
 
 ## 安装与运行
 
@@ -23,6 +25,13 @@ python -m release_pipeline build --repo . --targets t1,t2 --fail t2
 # 端到端：构建 + staging/canary/full 三阶段上线
 python -m release_pipeline run --repo . --work-dir .release-work
 
+# 预演：只预测，不落任何痕迹（work-dir 都不会创建）
+python -m release_pipeline plan --repo . --work-dir .release-work
+
+# 校验发布记录与实际产物自洽；比较两份记录
+python -m release_pipeline verify-record --work-dir .release-work
+python -m release_pipeline diff-records record-a.json record-b.json
+
 # 校验本地/CI 一致性契约
 python -m release_pipeline verify-parity --mode local
 ```
@@ -31,7 +40,7 @@ python -m release_pipeline verify-parity --mode local
 测试：
 
 ```bash
-pytest -q          # 48 个用例，全部在本地临时目录执行
+pytest -q          # 84 个用例，全部在本地临时目录执行
 ```
 
 ## 退出状态码（CLI 与编排层一致）
@@ -39,9 +48,13 @@ pytest -q          # 48 个用例，全部在本地临时目录执行
 | 码 | 含义 |
 |----|------|
 | 0  | 所有目标构建成功，且所有阶段推进成功 |
-| 2  | 一个或多个构建目标失败（其他目标可能已成功并上线） |
+| 2  | 部分（非全部）构建目标失败（其他目标可能已成功并上线） |
 | 3  | 某上线阶段健康门禁未通过并已回滚 |
-| 1  | 契约类错误（版本冲突、CI 下不支持的参数、状态损坏等） |
+| 4  | 全部构建目标失败（与部分失败明确区分，不合并为同一结论） |
+| 1  | 契约类错误（空目标集、非法阶段序列、未知目标/阶段、版本冲突、CI 下不支持的参数、状态损坏等） |
+
+`verify-record` 在校验出不一致时返回 1；`diff-records` 在两份记录不同
+时返回 1（相同返回 0），便于 CI 直接门控。
 
 ## 版本推导规则
 
@@ -109,8 +122,9 @@ format(缓存格式版本) · target · version · source_tree_hash
   `visible_version == 尝试前版本`，不一致则抛 `rollback_visibility_mismatch`。
   每次推进/回滚都追加到带锁状态文件的 `history` 中。
 * **重试安全**：已完全发布的版本重复调用是幂等 no-op；回滚后修复健康
-  策略可重新推进；中断遗留的 `.staging-*` / `.current.tmp-*` 在环境
-  初始化时被清扫，不会泄漏临时资源。
+  策略可重新推进；中断遗留的 `.staging-*` / `.current.tmp-*` 在下一次
+  上线尝试时、**持有该目标状态锁的前提下**被清扫——既不会泄漏临时
+  资源，也不会误删并发执行正在使用的暂存目录。
 
 ## 本地 / CI 一致性
 
@@ -125,6 +139,80 @@ format(缓存格式版本) · target · version · source_tree_hash
 * 对相同的显式输入，`mode=local` 与 `mode=ci` 产生相同版本、相同缓存
   决策与相同上线结论（有测试断言）。
 
+## 请求契约校验
+
+`run` 与 `plan` 在任何副作用（建目录、写缓存、改状态）之前先做统一
+校验（`validate.validate_config`），违例直接抛 `InvalidRequestError`
+并以机器可区分的 `code` 拒绝——不照常执行，也不悄悄推进一部分：
+
+| code | 含义 |
+|------|------|
+| `empty_targets` | 请求的目标集合为空 |
+| `duplicate_target` | 目标名重复 |
+| `unknown_target` | `--fail` 引用了未请求的目标 |
+| `empty_stages` | 阶段序列为空 |
+| `unknown_stage` | 阶段名（或健康策略键）不在 `staging/canary/full` 内 |
+| `invalid_stage_sequence` | 阶段序列不是 `staging→canary→full` 的严格递增子序列 |
+
+构建结果层面，`failure_kind` 字段（`none` / `partial` / `all`）与退出码
+2/4 把“部分失败”和“全部失败”明确分开，记录与摘要中均可机器读取。
+
+## 预演（dry-run）
+
+`python -m release_pipeline plan ...` 接受与 `run` 完全相同的参数，输出
+机器可读预测（JSON）：
+
+* **逐目标**：`reuse`（缓存命中，将复用产物）/ `rebuild`（缓存缺失或
+  损坏，将重新构建）/ `fail`（目标被配置为失败），附缓存键与缓存状态
+  （`hit` / `miss` / `corrupted`）；
+* **逐阶段**：从持久化状态出发模拟阶段链，给出 `from_stage`、
+  `final_stage`，以及会在哪一步被拦下（`blocked_at`）与原因
+  （`health-failed` / `health-inconclusive` / `release-in-progress`）；
+* **总体**：`would_exit_code` 使用与真实执行相同的优先级规则。
+
+保证：
+
+* **零痕迹**：预演只读——不创建任何目录（包括 work-dir 本身）、不写
+  缓存、不改状态、不动可见符号链接、不写记录；即使中途出错也不留
+  半成品。缓存探测是只读的，**不会**像真实读取那样逐出损坏条目。
+* **与执行一致**：同一组输入下，预演的复用/重建结论对应真实执行的
+  `cache-hit`/`built`，拦截阶段与原因对应真实执行的回滚；有测试逐项
+  断言。
+* **并发安全**：所有被读对象（缓存条目、状态文件、符号链接）都以原子
+  rename 发布，预演与其他执行并发时读到的是一致快照，既不破坏共享
+  状态，也不会被带偏。
+
+## 发布记录（release record）
+
+每次**真实**执行（`run`，预演不产生）在 `<work-dir>/records/
+record-<version>.json` 落一份机器可读记录，并随 CLI JSON 输出。记录
+包含：
+
+* `version`：版本号、提交、dirty 标记、来源、可复现哈希与完整变更
+  记录；
+* `inputs`：目标集、阶段序列、失败注入集、健康策略、环境指纹、配置
+  指纹、源码树哈希——即“哪些输入会影响结论”的完整清单；
+* `targets`：每个目标的状态与产物标识（产物名、`content_hash`、
+  `cache_key`）；
+* `stages_final`：每个目标最终落到的阶段、是否回滚、对外可见版本；
+* `outcome`：退出码、`failure_kind`、是否有上线被拦。
+
+**确定性**：记录只由声明的仓库根与显式输入决定——不含时间戳、绝对
+路径、主机信息，也不含重复执行间会变化的字段（`cache_hit`、`reason`
+字符串、尝试计数等被刻意排除）。因此同一组输入重复执行、切换工作目
+录、环境变量不同、本地与 CI 两种路径下，记录**逐字节一致**
+（`canonical_record_bytes`：键排序、紧凑分隔符的规范化 JSON）。
+
+**比较**：`diff-records A B`（或 `record.diff_records`）递归比对两份
+记录，输出 `{"identical", "changes": [{path, section, before, after}]}`；
+`section` 区分是**输入**变了（`inputs.*`）还是**结果**变了
+（`targets` / `stages_final` / `outcome` / `version`）。
+
+**自洽校验**：`verify-record`（或 `record.verify_record`）重新哈希
+`<work-dir>/artifacts/` 下的实际产物并与记录中的 `content_hash` 比对；
+产物缺失或摘要不符都会以结构化 `mismatches` 报出（CLI 退出 1），绝不
+悄悄当成正常。
+
 ## 并发与中断语义
 
 | 共享资源 | 保护方式 |
@@ -132,22 +220,29 @@ format(缓存格式版本) · target · version · source_tree_hash
 | 构建缓存条目 | 每键 `fcntl` 排他锁 + 临时目录 + 原子 rename |
 | 产物文件 | 唯一临时名 + `os.replace`，发布前再校验哈希 |
 | 发布状态 `state.json` | 全局锁内读改写；`tmp + fsync + rename` 落盘 |
+| 发布记录 `records/*.json` | 唯一临时名 + `fsync` + 原子 rename；同输入覆写为同字节 |
 | 对外可见符号链接 | 每次切换用唯一临时链接名原子替换 |
-| 异常中断 | 事务异常不落盘；临时目录/链接在下次启动清扫 |
+| 异常中断 | 事务异常不落盘；临时目录/链接在持锁的下一次尝试中清扫 |
+| 预演并发 | 全部只读 + 被读对象原子发布，天然无锁安全 |
 
 ## 目录结构
 
 ```
 release_pipeline/
   versioning.py   版本与变更记录推导
-  cache.py        内容寻址缓存（校验/逐出/原子发布）
+  cache.py        内容寻址缓存（校验/逐出/原子发布 + 只读探测）
   builder.py      多目标构建矩阵（源码哈希/环境与配置指纹）
   deploy.py       模拟环境、阶段推进、健康门禁、回滚
-  state.py        加锁的原子状态存储
+  state.py        加锁的原子状态存储（含只读读取）
+  validate.py     请求契约校验（空目标/非法阶段/未知目标等）
+  plan.py         预演：零痕迹的机器可读预测
+  record.py       发布记录：生成/规范化/比较/自洽校验
   parity.py       本地/CI 一致性契约
   pipeline.py     端到端编排与退出码
-  cli.py          命令行（version/build/run/verify-parity）
-tests/            48 个用例：重复执行、缓存失效、部分失败、回滚、并发等
+  cli.py          命令行（version/build/run/plan/verify-record/
+                  diff-records/verify-parity）
+tests/            84 个用例：重复执行、缓存失效、部分/全部失败、回滚、
+                  并发、预演零痕迹与一致性、记录确定性与可比较性等
 ```
 
 ## 本地手工验证建议
@@ -173,4 +268,33 @@ python -m release_pipeline run --repo . --work-dir /tmp/c --mode ci
 
 # 5) CI 对未知参数显式拒绝
 python -m release_pipeline run --repo . --mode ci --set bogus=1
+
+# 6) 预演：不创建 work-dir，输出逐目标/逐阶段预测
+python -m release_pipeline plan --repo . --work-dir /tmp/w6
+test ! -e /tmp/w6 && echo "zero trace"
+
+# 7) 预演与真实执行结论一致（先预演再执行，比对 would_exit_code）
+python -m release_pipeline plan --repo . --work-dir /tmp/w7 | jq .would_exit_code
+python -m release_pipeline run  --repo . --work-dir /tmp/w7 | jq .exit_code
+
+# 8) 发布记录：重复执行逐字节一致；比较不同输入的两份记录
+python -m release_pipeline run --repo . --work-dir /tmp/w8 >/dev/null
+cp /tmp/w8/records/record-*.json /tmp/rec-a.json
+python -m release_pipeline run --repo . --work-dir /tmp/w8 >/dev/null
+diff /tmp/rec-a.json /tmp/w8/records/record-*.json && echo "byte-identical"
+python -m release_pipeline run --repo . --work-dir /tmp/w9 \
+    --targets t1,t3 >/dev/null
+python -m release_pipeline diff-records \
+    /tmp/rec-a.json /tmp/w9/records/record-*.json
+
+# 9) 记录自洽校验：篡改产物必被发现
+python -m release_pipeline verify-record --work-dir /tmp/w8
+echo tampered > /tmp/w8/artifacts/app-0-*.bin
+python -m release_pipeline verify-record --work-dir /tmp/w8   # 退出 1
+
+# 10) 契约拒绝：空目标 / 非法阶段序列 / 全部失败（退出码 4）
+python -m release_pipeline run --repo . --targets ""            # empty_targets
+python -m release_pipeline run --repo . --stages full,staging   # invalid_stage_sequence
+python -m release_pipeline run --repo . --work-dir /tmp/w10 \
+    --targets t1,t2 --fail t1,t2                                # 退出 4
 ```

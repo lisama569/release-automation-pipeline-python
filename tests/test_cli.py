@@ -80,3 +80,80 @@ def test_local_mode_reports_degradation(tmp_path, git_repo):
     assert code == 0
     assert "ignored-params" in payload["degraded"]
     print(f"\n[test input] local --set bogus=1 degraded={payload['degraded']}")
+
+
+def test_plan_command_leaves_no_trace(tmp_path, git_repo):
+    work = tmp_path / "w"
+    code, out, _ = run_cli(
+        "plan", "--repo", str(git_repo), "--work-dir", str(work),
+        "--targets", "t1,t2",
+    )
+    payload = json.loads(out)
+    print(f"\n[test input] plan cmd -> would_exit={payload['would_exit_code']}")
+    assert code == 0
+    assert payload["would_exit_code"] == 0
+    assert [t["action"] for t in payload["targets"]] == ["rebuild", "rebuild"]
+    assert not work.exists()
+
+
+def test_plan_command_rejects_invalid_request(tmp_path, git_repo):
+    code, _, err = run_cli(
+        "plan", "--repo", str(git_repo), "--work-dir", str(tmp_path / "w"),
+        "--targets", "",
+    )
+    assert code == 1
+    assert "empty_targets" in err
+
+
+def test_run_writes_record_and_verify_record_roundtrip(tmp_path, git_repo):
+    work = tmp_path / "w"
+    code, out, _ = run_cli(
+        "run", "--repo", str(git_repo), "--work-dir", str(work),
+        "--targets", "t1",
+    )
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["record"]["outcome"]["failure_kind"] == "none"
+    records = list((work / "records").glob("record-*.json"))
+    assert len(records) == 1
+
+    code, out, _ = run_cli("verify-record", "--work-dir", str(work))
+    assert code == 0
+    assert json.loads(out)["ok"] is True
+
+    # Tamper -> verify-record must fail loudly.
+    artifact = next((work / "artifacts").glob("*.bin"))
+    artifact.write_bytes(b"tampered")
+    code, out, _ = run_cli("verify-record", "--work-dir", str(work))
+    assert code == 1
+    assert json.loads(out)["mismatches"]
+
+
+def test_diff_records_command_exit_codes(tmp_path, git_repo):
+    w1, w2 = tmp_path / "w1", tmp_path / "w2"
+    run_cli("run", "--repo", str(git_repo), "--work-dir", str(w1),
+            "--targets", "t1")
+    run_cli("run", "--repo", str(git_repo), "--work-dir", str(w2),
+            "--targets", "t2")
+    r1 = next((w1 / "records").glob("record-*.json"))
+    r2 = next((w2 / "records").glob("record-*.json"))
+
+    code, out, _ = run_cli("diff-records", str(r1), str(r1))
+    assert code == 0
+    assert json.loads(out)["identical"] is True
+
+    code, out, _ = run_cli("diff-records", str(r1), str(r2))
+    assert code == 1
+    assert json.loads(out)["identical"] is False
+
+
+def test_run_all_targets_fail_exit_4(tmp_path, git_repo):
+    code, out, _ = run_cli(
+        "run", "--repo", str(git_repo), "--work-dir", str(tmp_path / "w"),
+        "--targets", "t1,t2", "--fail", "t1,t2",
+    )
+    payload = json.loads(out)
+    print(f"\n[test input] --fail t1,t2 -> exit={code} "
+          f"kind={payload['failure_kind']}")
+    assert code == 4
+    assert payload["failure_kind"] == "all"

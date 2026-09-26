@@ -41,6 +41,25 @@ def new_state(version: str) -> dict:
     }
 
 
+def read_state_readonly(state_dir: str | Path) -> dict:
+    """Read ``state.json`` without creating anything.
+
+    Used by dry-run planning and record collection, which must not leave
+    traces: no directory creation, no lock-file touch. Writers persist via
+    atomic rename, so a lock-free read observes either the old or the new
+    file, never a torn one. Missing/unreadable state reads as ``{}``.
+    """
+    path = Path(state_dir) / STATE_FILE
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class ReleaseStateStore:
     """JSON state file guarded by an exclusive advisory lock."""
 

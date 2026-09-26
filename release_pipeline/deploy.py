@@ -43,6 +43,24 @@ NEXT_STAGE: dict[RolloutStage, RolloutStage] = {
 _GOOD = (True, True)
 
 
+def visible_version_readonly(env_root: str | Path) -> str | None:
+    """Read the externally visible version without creating anything.
+
+    Dry-run planning and record collection use this instead of instantiating
+    :class:`SimulatedEnvironment` (whose constructor creates directories and
+    sweeps temp resources — both forbidden side effects for read-only paths).
+    """
+    link = Path(env_root) / "current"
+    if not link.is_symlink() and not link.exists():
+        return None
+    try:
+        target = os.readlink(link)
+    except OSError:
+        return None
+    name = os.path.basename(target.rstrip("/"))
+    return name or None
+
+
 class SimulatedEnvironment:
     """A local, deterministic deployment target on disk."""
 
@@ -59,14 +77,18 @@ class SimulatedEnvironment:
         self.current_link = self.root / "current"
         self._policy = {k: tuple(v) for k, v in (health_by_stage or {}).items()}
         self._default = tuple(default_health)
-        self._sweep_crash_leftovers()
 
-    def _sweep_crash_leftovers(self) -> None:
+    def sweep_crash_leftovers(self) -> None:
         """Remove temp resources an interrupted prior run could leave.
 
         Completed work lives in ``releases/<version>`` and the ``current``
         symlink; only ``.staging-*`` and ``.current.tmp-*`` names are
         transient and safe to delete.
+
+        This must only run while holding the target's state lock (see
+        :func:`rollout`): an unlocked sweep cannot distinguish a crashed
+        run's leftovers from a *concurrently running* attempt's in-flight
+        staging directory and would delete the latter mid-rename.
         """
         for child in self.releases_dir.glob(".staging-*"):
             shutil.rmtree(child, ignore_errors=True)
@@ -169,6 +191,9 @@ def rollout(
     conflicts or failure to actually restore the previous release.
     """
     with store.transaction() as state:
+        # Sweep crash leftovers only under the target lock, so a concurrent
+        # attempt's in-flight staging dir is never mistaken for a leftover.
+        env.sweep_crash_leftovers()
         if not state:
             state.update(new_state(version))
         elif state.get("version") != version:

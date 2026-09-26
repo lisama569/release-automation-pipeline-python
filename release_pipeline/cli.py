@@ -25,6 +25,8 @@ from .errors import PipelineError
 from .models import BuildTarget
 from .parity import SUPPORTED_PARAMS, check_parity
 from .pipeline import PipelineConfig, run_pipeline
+from .plan import plan_pipeline
+from .record import diff_records, verify_record
 from .versioning import derive_version
 
 
@@ -76,6 +78,44 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="extra pipeline parameters (validated; rejected in ci mode)",
     )
+
+    pd = sub.add_parser(
+        "plan",
+        help="dry-run: predict reuse/rebuild and stage progression "
+        "without touching anything",
+    )
+    add_common(pd)
+    pd.add_argument("--targets", default="linux-x86_64,linux-aarch64")
+    pd.add_argument("--fail", default="")
+    pd.add_argument("--env-file", default=None)
+    pd.add_argument("--config-file", default=None)
+    pd.add_argument("--stages", default="staging,canary,full")
+    pd.add_argument("--health-file", default=None)
+    pd.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+    )
+
+    pvrec = sub.add_parser(
+        "verify-record",
+        help="check a release record against the artifacts on disk",
+    )
+    pvrec.add_argument("--work-dir", default=".release-work")
+    pvrec.add_argument(
+        "--record",
+        default=None,
+        help="record file; defaults to the newest in <work-dir>/records",
+    )
+
+    pdiff = sub.add_parser(
+        "diff-records",
+        help="machine-readable diff of two release records",
+    )
+    pdiff.add_argument("before")
+    pdiff.add_argument("after")
 
     pp = sub.add_parser("verify-parity", help="check local/CI parity contract")
     pp.add_argument("--mode", choices=("local", "ci"), default="local")
@@ -149,6 +189,33 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0
 
+        if args.command == "verify-record":
+            record_path = args.record
+            if record_path is None:
+                candidates = sorted(
+                    Path(args.work_dir).glob("records/record-*.json")
+                )
+                if not candidates:
+                    raise PipelineError(
+                        f"no records found under {args.work_dir}/records",
+                        code="record_missing",
+                    )
+                record_path = str(candidates[-1])
+            with open(record_path, "r", encoding="utf-8") as fh:
+                record = json.load(fh)
+            report = verify_record(record, args.work_dir)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report["ok"] else 1
+
+        if args.command == "diff-records":
+            with open(args.before, "r", encoding="utf-8") as fh:
+                before = json.load(fh)
+            with open(args.after, "r", encoding="utf-8") as fh:
+                after = json.load(fh)
+            report = diff_records(before, after)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report["identical"] else 1
+
         env = _load_json_file(getattr(args, "env_file", None))
         config = _load_json_file(getattr(args, "config_file", None))
         health = _load_json_file(getattr(args, "health_file", None))
@@ -200,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0 if report.all_succeeded else 2
 
-        if args.command == "run":
+        if args.command in ("run", "plan"):
             cfg = PipelineConfig(
                 repo_dir=args.repo,
                 work_dir=args.work_dir,
@@ -214,12 +281,18 @@ def main(argv: list[str] | None = None) -> int:
                 health_policy=health_policy,
                 extra_params=extra,
             )
+            if args.command == "plan":
+                plan = plan_pipeline(cfg)
+                print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+                return 0
             result = run_pipeline(cfg)
             print(json.dumps(
                 {
                     "exit_code": result.exit_code,
+                    "failure_kind": result.failure_kind,
                     "summary": result.summary,
                     "degraded": result.degraded,
+                    "record": result.record,
                     "deploy": [
                         {
                             "version": d.version,

@@ -68,3 +68,20 @@ class StateError(PipelineError):
     """Persistent release state is missing, locked or inconsistent."""
 
     code = "state_error"
+
+
+class InvalidRequestError(PipelineError):
+    """The request itself violates the pipeline contract.
+
+    Covers machine-distinguishable request problems such as an empty target
+    set, an unknown target/stage or a non-monotonic stage sequence. The
+    specific ``code`` identifies which contract was violated.
+    """
+
+    code = "invalid_request"
+
+
+class RecordMismatchError(PipelineError):
+    """A release record disagrees with the artifacts it refers to."""
+
+    code = "record_mismatch"
