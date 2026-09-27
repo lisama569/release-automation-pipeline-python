@@ -10,7 +10,11 @@ cache decisions and identical verdicts.
 
 Exit codes
 ----------
-0  all targets built and every configured stage advanced
+0  all targets built and every deployable target reached the LAST requested
+   stage (intermediate stages skipped in the request are still traversed and
+   health-gated; a run stopping short of that destination is never a success)
+1  a contract/state error aborted a rollout (e.g. a different release is
+   mid-flight in a target's persisted state: ``release_in_progress``)
 2  some (but not all) build targets failed (others may still be deployed)
 3  a rollout stage was blocked and rolled back
 4  every requested build target failed
@@ -29,6 +33,7 @@ from .builder import (
 )
 from .cache import BuildCache
 from .deploy import SimulatedEnvironment, rollout, visible_version_readonly
+from .errors import StateError
 from .models import (
     BuildReport,
     BuildTarget,
@@ -41,13 +46,35 @@ from .log import log
 from .parity import check_parity
 from .record import build_record, write_record
 from .state import ReleaseStateStore, read_state_readonly
-from .validate import validate_config
+from .validate import STAGE_ORDER, validate_config
 from .versioning import derive_version
 
 EXIT_OK = 0
 EXIT_BUILD_FAILED = 2
 EXIT_ROLLOUT_BLOCKED = 3
 EXIT_BUILD_FAILED_ALL = 4
+# Contract/state error the plan predicted would abort the rollout (e.g. a
+# different release is mid-flight in the persisted target state).
+EXIT_ERROR = 1
+
+# Position of every stage on the canonical progression chain; the real run
+# walks this chain one gated step at a time until it reaches the *last* stage
+# requested, regardless of which intermediate stages were named.
+STAGE_RANK: dict[str, int] = {
+    RolloutStage.NONE.value: 0,
+    **{name: i + 1 for i, name in enumerate(STAGE_ORDER)},
+}
+
+
+def _requested_destination(cfg: PipelineConfig) -> RolloutStage:
+    """The final stage a run must reach: the last one requested.
+
+    Validation guarantees ``cfg.stages`` is a strictly increasing subsequence
+    of :data:`validate.STAGE_ORDER`, so its last element is the furthest
+    requested stage. Skipped intermediate stages are still traversed (and
+    their health gates still enforced) during the real walk.
+    """
+    return RolloutStage(cfg.stages[-1])
 
 
 @dataclass
@@ -80,6 +107,11 @@ class PipelineResult:
     failure_kind: str = "none"
     # Machine-readable, byte-deterministic receipt of this real run.
     record: dict = field(default_factory=dict)
+    # Per-target state conflicts that abort a rollout before it starts
+    # (e.g. another release mid-flight). Each entry is
+    # {"target", "stage", "version", "code"}. Deterministic and excluded
+    # from the byte-stable record (it describes persisted foreign state).
+    deploy_errors: tuple[dict, ...] = ()
 
 
 def _build_targets(cfg: PipelineConfig) -> list[BuildTarget]:
@@ -154,6 +186,8 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     # its own simulated environment and its own state file.
     deploys: list[DeployResult] = []
     deploy_blocked = False
+    deploy_conflicts: list[dict] = []
+    destination = _requested_destination(cfg)
     for result in report.results:
         target_name = result.target
         if result.artifact is None:
@@ -169,16 +203,56 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
             env_root / target_name,
             health_by_stage=dict(cfg.health_policy),
         )
-        # Advance through exactly the configured number of stages.
-        chain = [RolloutStage.NONE] + [RolloutStage(s) for s in cfg.stages]
+        # Walk the canonical chain one gated step at a time until the LAST
+        # requested stage is reached. Stages skipped in the request (e.g.
+        # "staging,full") are still traversed and health-gated here; a run
+        # that stops short of the requested destination is never a success.
         current = _current_stage(store)
-        while current in chain and current != chain[-1]:
-            dr = rollout(env, result.artifact, version.version, store)
+        stored_version = store.read().get("version")
+        already_there = (
+            stored_version == version.version
+            and STAGE_RANK[current.value] >= STAGE_RANK[destination.value]
+        )
+        if already_there:
+            # This release is already at/beyond the requested destination:
+            # an idempotent no-op with zero rollout calls, so a repeat leaves
+            # the persisted state untouched. The deploy-level no-op for a
+            # completed full remains exercised directly by deploy's tests.
+            continue
+        # Otherwise promote: rollout() itself resets a clean, superseded
+        # "full" to the new release starting at none, and raises
+        # release_in_progress for a foreign release stuck mid-flight.
+        while True:
+            try:
+                dr = rollout(env, result.artifact, version.version, store)
+            except StateError as exc:
+                # A foreign release mid-flight aborts this target's rollout;
+                # capture it deterministically instead of crashing the whole
+                # run, so the result matches what plan predicted (exit 1).
+                if exc.code == "release_in_progress":
+                    stuck = _current_stage(store)
+                    deploy_conflicts.append(
+                        {
+                            "target": target_name,
+                            "stage": stuck.value,
+                            "version": version.version,
+                            "code": exc.code,
+                        }
+                    )
+                    log(
+                        "pipeline",
+                        "rollout refused: another release in progress",
+                        target=target_name,
+                        stage=stuck.value,
+                    )
+                    break
+                raise
             deploys.append(dr)
             if dr.rolled_back:
                 deploy_blocked = True
                 break
-            current = dr.stage
+            if STAGE_RANK[dr.stage.value] >= STAGE_RANK[destination.value]:
+                break
 
     # Distinguish "every target failed" from "some targets failed"; the two
     # must never collapse into one conclusion.
@@ -194,7 +268,12 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         exit_code = EXIT_BUILD_FAILED_ALL
     elif failure_kind == "partial":
         exit_code = EXIT_BUILD_FAILED
-    if deploy_blocked and exit_code == EXIT_OK:
+    elif deploy_conflicts:
+        # Contract/state error wins over a mere health block, matching the
+        # dry-run precedence; "all builds failed" keeps code 4 (no rollout
+        # was even attempted for those targets).
+        exit_code = EXIT_ERROR
+    elif deploy_blocked:
         exit_code = EXIT_ROLLOUT_BLOCKED
     # Partial/total build failure and rollout failure are both reportable;
     # build failure keeps its dedicated code, rollout is in the summary.
@@ -205,6 +284,8 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         f"failure_kind={failure_kind}",
         f"failed_targets={[r.target for r in report.failed]}",
         f"rollbacks={[d.version + '@' + d.stage.value for d in deploys if d.rolled_back]}",
+        f"conflicts={[c['target'] + '@' + c['stage'] for c in deploy_conflicts]}",
+        f"destination={destination.value}",
         f"exit={exit_code}",
     ]
     summary = " ".join(parts)
@@ -252,6 +333,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         degraded=parity.get("degraded", ""),
         failure_kind=failure_kind,
         record=record,
+        deploy_errors=tuple(deploy_conflicts),
     )
 
 

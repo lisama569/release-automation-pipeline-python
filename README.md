@@ -40,18 +40,18 @@ python -m release_pipeline verify-parity --mode local
 测试：
 
 ```bash
-pytest -q          # 84 个用例，全部在本地临时目录执行
+pytest -q          # 112 个用例，全部在本地临时目录执行
 ```
 
 ## 退出状态码（CLI 与编排层一致）
 
 | 码 | 含义 |
 |----|------|
-| 0  | 所有目标构建成功，且所有阶段推进成功 |
+| 0  | 所有目标构建成功，且每个参与部署的目标都到达了**请求的最后一个阶段** |
+| 1  | 契约类错误（空目标集、非法阶段序列、未知目标/阶段、版本冲突、CI 下不支持的参数、状态损坏），或某目标已有**别的版本发布卡在中间阶段**（`release_in_progress`），本次推进被明确拒绝 |
 | 2  | 部分（非全部）构建目标失败（其他目标可能已成功并上线） |
-| 3  | 某上线阶段健康门禁未通过并已回滚 |
+| 3  | 某上线阶段健康门禁未通过（不健康或结论不明确）并已回滚 |
 | 4  | 全部构建目标失败（与部分失败明确区分，不合并为同一结论） |
-| 1  | 契约类错误（空目标集、非法阶段序列、未知目标/阶段、版本冲突、CI 下不支持的参数、状态损坏等） |
 
 `verify-record` 在校验出不一致时返回 1；`diff-records` 在两份记录不同
 时返回 1（相同返回 0），便于 CI 直接门控。
@@ -110,11 +110,23 @@ format(缓存格式版本) · target · version · source_tree_hash
 <env>/current -> releases/<version>     # 唯一对外可见入口（符号链接）
 ```
 
-* **阶段链**：`none → staging → canary → full`，每次调用只推进一阶段。
+* **阶段链**：`none → staging → canary → full`，每次 `rollout` 调用只
+  推进一阶段。
+* **请求序列只是“要到哪里”**：`--stages` 必须是
+  `staging → canary → full` 的**严格递增子序列**（允许跳过中间阶段，
+  如 `staging,full` 或单独 `canary`）。真实执行以请求的**最后一个
+  阶段为目的地**，沿规范链**逐阶段推进到那里**——被跳过的中间阶段
+  仍然要真实经过、其健康关卡照常生效。比如请求 `staging,full` 时会
+  依次通过 `staging → canary → full` 三道关卡，绝不能停在 `canary`
+  就报成功；请求 `full` 时也要先过 `staging`、`canary`。
+* **必须到达目的地才算成功**：只要还有目标没到达请求的最终阶段，就
+  不会出现“成功（退出 0）”的结论。
 * **健康门禁**：只有 `healthy=true 且 conclusive=true` 才推进。
   - 不健康 → 回滚；
   - **健康结论不明确（inconclusive）同样按失败处理并回滚**，绝不带着
-    不确定性推进。
+    不确定性推进；
+  - 回滚后该目标停在上一个已确认健康的阶段（被拦下的阶段记录在
+    `blocked_at`），退出码 3。
 * **原子切换**：发布物先安装到独立目录，可见性切换是一次符号链接的
   原子 rename；观察者只能看到旧版或新版，看不到半成品。
 * **回滚可解释且可见状态一致**：回滚把 `current` 精确恢复到本次尝试前
@@ -152,7 +164,11 @@ format(缓存格式版本) · target · version · source_tree_hash
 | `unknown_target` | `--fail` 引用了未请求的目标 |
 | `empty_stages` | 阶段序列为空 |
 | `unknown_stage` | 阶段名（或健康策略键）不在 `staging/canary/full` 内 |
-| `invalid_stage_sequence` | 阶段序列不是 `staging→canary→full` 的严格递增子序列 |
+| `invalid_stage_sequence` | 阶段序列不是 `staging→canary→full` 的严格递增子序列（回退、重复同样拒绝） |
+
+> 阶段序列表达的是“目的地”而不是“只走这几步”：允许写
+> `staging,full` 或单独 `canary`，但真实执行会把中间跳过的阶段
+> （及其健康关卡）全部补齐，直到最后一个请求阶段。
 
 构建结果层面，`failure_kind` 字段（`none` / `partial` / `all`）与退出码
 2/4 把“部分失败”和“全部失败”明确分开，记录与摘要中均可机器读取。
@@ -165,10 +181,38 @@ format(缓存格式版本) · target · version · source_tree_hash
 * **逐目标**：`reuse`（缓存命中，将复用产物）/ `rebuild`（缓存缺失或
   损坏，将重新构建）/ `fail`（目标被配置为失败），附缓存键与缓存状态
   （`hit` / `miss` / `corrupted`）；
-* **逐阶段**：从持久化状态出发模拟阶段链，给出 `from_stage`、
-  `final_stage`，以及会在哪一步被拦下（`blocked_at`）与原因
+* **逐阶段**：从持久化状态出发，用与真实执行**完全相同**的规则模拟
+  阶段链，给出 `from_stage`（模拟开始时持久化的阶段）、`final_stage`
+  （最终落在哪里）、`blocked_at`（会在哪一步被拦下）与原因
+  （`health-failed` / `health-inconclusive` / `release-in-progress`；
+  目标版本已不低于请求阶段时给出 `already-beyond-requested-stages`）。
+  模拟沿规范链一路走到**请求的最后一个阶段**，被请求跳过的中间阶段
+  同样参与健康判定；
+* **总体**：`would_exit_code` 使用与真实执行相同的优先级规则
+  （全部构建失败 4 > 部分失败 2 > 版本冲突/发布进行中 1 >
+  健康拦截 3 > 成功 0）。
+
+### 怎么读预演结论，以及它与真实执行的一致性
+
+同一组输入、同一个（预演前尚未被改动的）work-dir 下，先 `plan` 再
+`run`，两份结论逐项一致：
+
+* 预演逐目标的 `reuse`/`rebuild`/`fail` ↔ 真实执行的
+  `cache-hit`/`built`/`failed`；
+* 预演逐目标的 `final_stage` ↔ 真实执行后持久化状态里的 `stage`
+  （以及 `current` 实际指向）；
+* 预演说在某阶段 `blocked_at` 被拦下 ↔ 真实执行在**同一个阶段**回滚，
+  停在同一个 `final_stage`，原因类别相同
   （`health-failed` / `health-inconclusive` / `release-in-progress`）；
-* **总体**：`would_exit_code` 使用与真实执行相同的优先级规则。
+* `would_exit_code` ↔ `exit_code`。
+
+关键语义：**预演说会到达某阶段，真实执行就一定真的到达那里；预演说
+会被拦下，真实执行也一定被同一关卡拦下。** 不会再出现“预演一路到
+`full`、真实执行却停在 `canary` 还报成功”的错位。若持久化状态里已有
+**另一个版本**发布在中间阶段（非干净完成的 `full`），`run` 不再让整个
+进程崩掉，而是像预演预测的那样对该目标返回 `release_in_progress`
+（退出 1，且不改动外版本、不安装新版本），并在 CLI 输出的
+`deploy_errors` 中按目标列出。
 
 保证：
 
@@ -177,10 +221,11 @@ format(缓存格式版本) · target · version · source_tree_hash
   半成品。缓存探测是只读的，**不会**像真实读取那样逐出损坏条目。
 * **与执行一致**：同一组输入下，预演的复用/重建结论对应真实执行的
   `cache-hit`/`built`，拦截阶段与原因对应真实执行的回滚；有测试逐项
-  断言。
+  断言（含跳过中间阶段的序列）。
 * **并发安全**：所有被读对象（缓存条目、状态文件、符号链接）都以原子
   rename 发布，预演与其他执行并发时读到的是一致快照，既不破坏共享
-  状态，也不会被带偏。
+  状态，也不会被带偏。真实执行的每次推进仍在每目标的状态锁内读改写，
+  并发 `run` 之间、`plan` 与 `run` 之间都不会互相污染结论。
 
 ## 发布记录（release record）
 
@@ -241,8 +286,9 @@ release_pipeline/
   pipeline.py     端到端编排与退出码
   cli.py          命令行（version/build/run/plan/verify-record/
                   diff-records/verify-parity）
-tests/            84 个用例：重复执行、缓存失效、部分/全部失败、回滚、
-                  并发、预演零痕迹与一致性、记录确定性与可比较性等
+tests/            112 个用例：重复执行、缓存失效、部分/全部失败、回滚、
+                  并发、预演零痕迹与逐项一致性（含跳过中间阶段的序列）、
+                  契约拒绝、记录确定性与可比较性等
 ```
 
 ## 本地手工验证建议
@@ -277,6 +323,22 @@ test ! -e /tmp/w6 && echo "zero trace"
 python -m release_pipeline plan --repo . --work-dir /tmp/w7 | jq .would_exit_code
 python -m release_pipeline run  --repo . --work-dir /tmp/w7 | jq .exit_code
 
+# 7b) 跳过中间阶段：请求 staging,full 必须一路推进到 full（含 canary 关卡）
+python -m release_pipeline plan --repo . --work-dir /tmp/w7b \
+    --targets t1 --stages staging,full | jq '.stages[0].final_stage'  # "full"
+python -m release_pipeline run  --repo . --work-dir /tmp/w7b \
+    --targets t1 --stages staging,full | jq .exit_code               # 0
+readlink /tmp/w7b/environments/t1/current                            # 已指向该版本
+
+# 7c) 跳过阶段但被中间关卡拦下：预演与真实执行都停在 canary，退出 3
+echo '{"canary":[false,true]}' > /tmp/h-block-canary.json
+python -m release_pipeline plan --repo . --work-dir /tmp/w7c \
+    --targets t1 --stages staging,full --health-file /tmp/h-block-canary.json \
+    | jq '{final: .stages[0].final_stage, blocked: .stages[0].blocked_at, exit: .would_exit_code}'
+python -m release_pipeline run  --repo . --work-dir /tmp/w7c \
+    --targets t1 --stages staging,full --health-file /tmp/h-block-canary.json \
+    | jq .exit_code                                                   # 3
+
 # 8) 发布记录：重复执行逐字节一致；比较不同输入的两份记录
 python -m release_pipeline run --repo . --work-dir /tmp/w8 >/dev/null
 cp /tmp/w8/records/record-*.json /tmp/rec-a.json
@@ -292,9 +354,15 @@ python -m release_pipeline verify-record --work-dir /tmp/w8
 echo tampered > /tmp/w8/artifacts/app-0-*.bin
 python -m release_pipeline verify-record --work-dir /tmp/w8   # 退出 1
 
-# 10) 契约拒绝：空目标 / 非法阶段序列 / 全部失败（退出码 4）
+# 10) 契约拒绝：空目标 / 空阶段 / 未知阶段 / 非法阶段序列 / 全部失败（退出码 4）
 python -m release_pipeline run --repo . --targets ""            # empty_targets
+python -m release_pipeline plan --repo . --stages ""            # empty_stages（plan 同样拒绝）
+python -m release_pipeline run --repo . --stages staging,mars   # unknown_stage
 python -m release_pipeline run --repo . --stages full,staging   # invalid_stage_sequence
 python -m release_pipeline run --repo . --work-dir /tmp/w10 \
     --targets t1,t2 --fail t1,t2                                # 退出 4
 ```
+
+非法请求在任何副作用（建目录、构建、部署、写状态/记录）**之前**被拒绝，
+因此既不会照常上线，也不会只悄悄推进一部分；`plan` 与 `run` 使用同一套
+校验、返回同一个机器可区分的 `code`（见“请求契约校验”一节）。

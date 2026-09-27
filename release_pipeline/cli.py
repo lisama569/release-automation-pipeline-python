@@ -292,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
                     "failure_kind": result.failure_kind,
                     "summary": result.summary,
                     "degraded": result.degraded,
+                    "deploy_errors": list(result.deploy_errors),
                     "record": result.record,
                     "deploy": [
                         {

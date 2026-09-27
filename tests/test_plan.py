@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import threading
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from release_pipeline.errors import InvalidRequestError
 from release_pipeline.pipeline import PipelineConfig, run_pipeline
 from release_pipeline.plan import plan_pipeline
+from release_pipeline.state import read_state_readonly
 
 pytestmark = pytest.mark.logging_inputs
 
@@ -20,6 +22,68 @@ def _cfg(work, repo, **over):
     kw = dict(work_dir=str(work), mode="local")
     kw.update(over)
     return PipelineConfig(repo_dir=str(repo), **kw)
+
+
+def _assert_plan_matches_run(plan, result, work: Path, *,
+                             deploy_targets: tuple[str, ...]) -> None:
+    """Item-by-item equivalence of a dry-run plan and the run right after it.
+
+    Checks, for identical inputs on the same (previously untouched) work dir:
+    * per-target reuse/rebuild/fail <-> real cache-hit/built/failed;
+    * per-target final stage, blocked stage and block-reason kind;
+    * the persisted post-run stage equals the predicted final stage;
+    * the predicted exit code equals the real exit code.
+    """
+    by_name = {tr.target: tr for tr in result.build.results}
+    for tp in plan.targets:
+        tr = by_name[tp.target]
+        if tp.action == "reuse":
+            assert tr.reason == "cache-hit", tp.target
+        elif tp.action == "rebuild":
+            assert tr.reason == "built", tp.target
+        else:
+            assert tp.action == "fail"
+            assert tr.status.value == "failed", tp.target
+
+    real_errors = {e["target"]: e for e in result.deploy_errors}
+    plan_stages = {s.target: s for s in plan.stages}
+    rollbacks = {}
+    for d in result.deploys:
+        if d.rolled_back:
+            kind = "health-inconclusive" if "inconclusive" in d.reason \
+                else "health-failed"
+            rollbacks[d.version] = (d, kind)  # last rollback wins per target
+    # Map rollbacks back to targets via the artifact version.
+    rollback_by_target: dict[str, tuple] = {}
+    for tr in result.build.results:
+        if tr.artifact is not None and tr.artifact.version in rollbacks:
+            rollback_by_target[tr.target] = rollbacks[tr.artifact.version]
+
+    for name in deploy_targets:
+        state = read_state_readonly(work / "state" / name)
+        persisted = state.get("stage", "none")
+        sp = plan_stages[name]
+        # Predicted final stage is what really gets persisted.
+        assert persisted == sp.final_stage, (
+            f"{name}: persisted {persisted} != plan final {sp.final_stage}"
+        )
+        if sp.blocked_at and sp.block_reason.startswith("release-in-progress"):
+            err = real_errors.get(name)
+            assert err is not None and err["stage"] == sp.blocked_at, name
+            assert rollback_by_target.get(name) is None
+        elif sp.blocked_at:
+            assert sp.blocked_at is not None
+            rolled, kind = rollback_by_target[name]
+            assert rolled.stage.value == sp.final_stage, name
+            assert kind in sp.block_reason, (name, sp.block_reason)
+        else:
+            assert name not in rollback_by_target, name
+            assert name not in real_errors, name
+
+    assert plan.would_exit_code == result.exit_code, (
+        plan.summary, result.exit_code
+    )
+
 
 
 def _snapshot(root: Path) -> dict[str, tuple[str, str | None]]:
@@ -77,9 +141,13 @@ def test_plan_matches_real_run_when_cache_empty(tmp_path, git_repo):
         else:
             assert tr.status.value == "failed"
     # Per stage: blocked at the same place for the same reason kind.
-    for sp, dr in zip(plan.stages,
-                      [d for d in result.deploys if d.rolled_back]):
-        assert sp.blocked_at == dr.stage.value or True
+    rolled_back = [d for d in result.deploys if d.rolled_back]
+    assert len(rolled_back) == len(plan.stages)
+    for sp, dr in zip(plan.stages, rolled_back):
+        assert sp.blocked_at == "canary"
+        assert dr.stage.value == sp.final_stage == "staging"
+        assert "health-failed" in sp.block_reason
+        assert "health-failed" in dr.reason
     assert plan.would_exit_code == result.exit_code == 3
     assert all(s.blocked_at == "canary" for s in plan.stages)
     assert all("health-failed" in s.block_reason for s in plan.stages)
@@ -215,3 +283,163 @@ def test_plan_is_independent_of_cwd_and_ambient_env(
     monkeypatch.setenv("CC", "totally-different")
     p2 = plan_pipeline(cfg)
     assert p1.to_dict() == p2.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Regression: stage sequences that skip intermediate stages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [("staging", "full"), ("canary",), ("full",),
+     ("staging",), ("canary", "full")],
+)
+def test_plan_and_run_reach_last_requested_stage_for_skipped_sequence(
+    tmp_path, git_repo, stages
+):
+    work = tmp_path / ("w-" + "-".join(stages))
+    cfg = _cfg(work, git_repo, targets=("t1",), stages=stages)
+    plan = plan_pipeline(cfg)
+    result = run_pipeline(cfg)
+    # The plan names the last requested stage as the destination...
+    sp = plan.stages[0]
+    assert sp.final_stage == stages[-1]
+    assert sp.blocked_at is None
+    assert sp.block_reason == ""
+    # ...and the real run really gets there, with exit 0 (no false success
+    # before reaching the requested final stage).
+    state = read_state_readonly(work / "state" / "t1")
+    assert state["stage"] == stages[-1]
+    assert state["rolled_back"] is False
+    assert (work / "environments" / "t1" / "current").is_symlink()
+    _assert_plan_matches_run(plan, result, work, deploy_targets=("t1",))
+    print(f"\n[test input] stages={stages} -> both reach {stages[-1]} "
+          f"exit={result.exit_code}")
+
+
+@pytest.mark.parametrize(
+    "stages,policy,blocked,final",
+    [
+        # Skip canary in the request, but the canary gate still runs and
+        # blocks: must never report success at staging.
+        (("staging", "full"), {"canary": (False, True)}, "canary", "staging"),
+        # Request only full; every intermediate gate still applies.
+        (("full",), {"staging": (False, True)}, "staging", "none"),
+        (("full",), {"staging": (True, False)}, "staging", "none"),
+        (("full",), {"canary": (False, True)}, "canary", "staging"),
+        (("full",), {"full": (True, False)}, "full", "canary"),
+        # Request only canary: staging gate first, then canary.
+        (("canary",), {"canary": (False, True)}, "canary", "staging"),
+        (("canary",), {"staging": (False, True)}, "staging", "none"),
+    ],
+)
+def test_plan_and_run_block_at_same_gate_for_skipped_sequence(
+    tmp_path, git_repo, stages, policy, blocked, final
+):
+    work = tmp_path / "w"
+    cfg = _cfg(work, git_repo, targets=("t1",), stages=stages,
+               health_policy=policy)
+    plan = plan_pipeline(cfg)
+    result = run_pipeline(cfg)
+    sp = plan.stages[0]
+    assert sp.blocked_at == blocked
+    assert sp.final_stage == final
+    assert plan.would_exit_code == result.exit_code == 3
+    state = read_state_readonly(work / "state" / "t1")
+    assert state["stage"] == final
+    assert state["rolled_back"] is True
+    rolled = [d for d in result.deploys if d.rolled_back]
+    assert rolled and rolled[-1].stage.value == final
+    print(f"\n[test input] stages={stages} policy={policy} -> both blocked "
+          f"at {blocked}, final {final}")
+
+
+def test_plan_and_run_match_when_plan_runs_first_with_partial_failure(
+    tmp_path, git_repo
+):
+    # Skipped stages AND a partial build failure: t2 fails, t1 reaches full.
+    work = tmp_path / "w"
+    kw = dict(targets=("t1", "t2"), failing_targets=frozenset({"t2"}),
+              stages=("staging", "full"))
+    plan = plan_pipeline(_cfg(work, git_repo, **kw))
+    result = run_pipeline(_cfg(work, git_repo, **kw))
+    assert [t.action for t in plan.targets] == ["rebuild", "fail"]
+    assert {s.target for s in plan.stages} == {"t1"}
+    assert plan.stages[0].final_stage == "full"
+    _assert_plan_matches_run(plan, result, work, deploy_targets=("t1",))
+    assert plan.would_exit_code == result.exit_code == 2
+
+
+def test_plan_then_run_second_time_still_match(tmp_path, git_repo):
+    # plan -> run -> plan -> run on a skipped sequence: every pair agrees.
+    work = tmp_path / "w"
+    cfg = _cfg(work, git_repo, targets=("t1",), stages=("staging", "full"),
+               health_policy={"canary": (False, True)})
+    p1 = plan_pipeline(cfg)
+    r1 = run_pipeline(cfg)
+    assert p1.would_exit_code == r1.exit_code == 3
+    p2 = plan_pipeline(cfg)
+    r2 = run_pipeline(cfg)
+    for p, r in ((p1, r1), (p2, r2)):
+        assert p.stages[0].blocked_at == "canary"
+        assert p.would_exit_code == r.exit_code == 3
+
+
+def test_plan_with_skipped_stages_leaves_zero_trace(tmp_path, git_repo):
+    # The zero-trace guarantee also holds for sequences that skip stages.
+    work = tmp_path / "w"
+    assert not work.exists()
+    plan_pipeline(_cfg(work, git_repo, targets=("t1", "t2"),
+                       stages=("staging", "full")))
+    assert not work.exists()
+
+
+def test_plan_after_partial_real_run_leaves_everything_unchanged(
+    tmp_path, git_repo
+):
+    work = tmp_path / "w"
+    run_pipeline(_cfg(work, git_repo, targets=("t1",), stages=("canary",)))
+    before = _snapshot(work)
+    plan_pipeline(_cfg(work, git_repo, targets=("t1",),
+                       stages=("staging", "full")))
+    assert _snapshot(work) == before
+
+
+def test_plan_and_run_agree_on_release_in_progress(tmp_path, git_repo):
+    # A different release stuck mid-flight: plan predicts the refusal (and
+    # exit 1); the real run is refused at the same stage instead of crashing
+    # or claiming success.
+    from release_pipeline.models import RolloutStage
+    from release_pipeline.state import ReleaseStateStore, new_state
+
+    work = tmp_path / "w"
+    store = ReleaseStateStore(work / "state" / "t1")
+    with store.transaction() as st:
+        st.update(new_state("9.9.9+9.gdeadbeef"))
+        st["stage"] = RolloutStage.CANARY.value
+    pre = _snapshot(work)
+    cfg = _cfg(work, git_repo, targets=("t1",), stages=("full",))
+    plan = plan_pipeline(cfg)
+    # Planning around the foreign state still leaves it byte-for-byte intact.
+    assert _snapshot(work) == pre
+    sp = plan.stages[0]
+    assert sp.blocked_at == "canary"
+    assert sp.final_stage == "canary"
+    assert sp.block_reason.startswith("release-in-progress")
+    assert plan.would_exit_code == 1
+    result = run_pipeline(cfg)
+    assert result.exit_code == 1
+    assert result.deploy_errors == (
+        {"target": "t1", "stage": "canary",
+         "version": result.version.version, "code": "release_in_progress"},
+    )
+    # The foreign state is untouched, and the refused run never made the
+    # foreign release visible (no current symlink, no installed release).
+    after = read_state_readonly(work / "state" / "t1")
+    assert after["version"] == "9.9.9+9.gdeadbeef"
+    assert after["stage"] == "canary"
+    env_t1 = work / "environments" / "t1"
+    assert not (env_t1 / "current").exists()
+    assert not (env_t1 / "releases" / result.version.version).exists()
+

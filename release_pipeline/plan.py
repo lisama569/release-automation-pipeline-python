@@ -17,10 +17,16 @@ rules as :func:`release_pipeline.pipeline.run_pipeline`:
 * per target: ``reuse`` iff the cache probe hits, ``rebuild`` on
   miss/corruption, ``fail`` for targets configured to fail — matching the
   real run's ``cache-hit`` / ``built`` / ``failed`` outcomes;
-* per stage: the rollout chain is simulated with the same health policy and
-  the same persisted starting stage, so ``blocked_at`` / ``block_reason``
-  match the real run's rollback stage and reason;
-* the predicted exit code uses the same precedence rules as the real run.
+* per stage: the rollout is simulated from the persisted starting stage with
+  the same health policy and the same deploy state-machine rules. The walk
+  follows the canonical ``none -> staging -> canary -> full`` chain one
+  gated step at a time until the LAST requested stage is reached, so stages
+  the request skips (e.g. ``staging,full`` still gates ``canary``) are
+  simulated too. A clean, superseded ``full`` restarts at ``none``; a
+  foreign release mid-flight predicts ``release-in-progress``. Hence
+  ``final_stage`` / ``blocked_at`` / ``block_reason`` match the real run;
+* the predicted exit code uses the same precedence rules as the real run
+  (all-failed 4 > partial 2 > conflict 1 > health-blocked 3 > ok 0).
 
 Concurrency
 -----------
@@ -48,18 +54,17 @@ from .parity import check_parity
 from .pipeline import (
     EXIT_BUILD_FAILED,
     EXIT_BUILD_FAILED_ALL,
+    EXIT_ERROR,
     EXIT_OK,
     EXIT_ROLLOUT_BLOCKED,
+    STAGE_RANK,
     PipelineConfig,
     _build_targets,
+    _requested_destination,
 )
 from .state import read_state_readonly
 from .validate import validate_config
 from .versioning import derive_version
-
-# Predicted exit code when the real run would raise a contract/state error
-# (e.g. a different release is mid-flight in the persisted state).
-EXIT_WOULD_ERROR = 1
 
 _GOOD = (True, True)
 
@@ -143,48 +148,68 @@ def _plan_stages_for_target(
 ) -> StagePlan:
     """Simulate the rollout chain for one target from persisted state."""
     state = read_state_readonly(state_dir / target)
-    current = state.get("stage", RolloutStage.NONE.value)
-    chain = [RolloutStage.NONE.value] + list(cfg.stages)
-    return _simulate_chain(cfg, target, state, current, chain)
+    from_stage = state.get("stage", RolloutStage.NONE.value)
+    destination = _requested_destination(cfg)
+    return _simulate_chain(cfg, target, state, from_stage, destination)
 
 
 def _simulate_chain(
     cfg: PipelineConfig,
     target: str,
     state: dict,
-    current: str,
-    chain: list[str],
+    from_stage: str,
+    destination: RolloutStage,
 ) -> StagePlan:
+    """Predict one target's rollout using the exact deploy state rules.
+
+    The walk mirrors :func:`release_pipeline.deploy.rollout` and the real
+    orchestration loop, so the prediction can never disagree with the run:
+
+    * a different version sitting at completed ``full`` starts the new
+      release over at ``none`` (the real run resets state and walks again);
+    * a different version mid-flight (any other persisted stage, or a
+      rolled-back ``full``) refuses the promotion — ``release-in-progress``;
+    * otherwise the walk advances one canonical stage at a time until the
+      LAST requested stage is reached, health-gating every intermediate
+      stage, including ones the request skipped (e.g. ``staging,full``
+      still gates ``canary``);
+    * persisted progress already beyond the requested destination means the
+      real run makes zero rollout calls — nothing changes.
+    """
     version = getattr(cfg, "_planned_version", None)
     stored_version = state.get("version")
-    if state and stored_version and stored_version != version:
-        if not (
-            current == RolloutStage.FULL.value and not state.get("rolled_back")
-        ):
+    stage = from_stage
+
+    # A foreign (different-version) release: a completed full is superseded
+    # and the new release restarts at none; anything else mid-flight refuses.
+    foreign = bool(state and stored_version and stored_version != version)
+    if foreign:
+        if stage == RolloutStage.FULL.value and not state.get("rolled_back"):
+            stage = RolloutStage.NONE.value
+        else:
             return StagePlan(
                 target=target,
-                from_stage=current,
-                final_stage=current,
-                blocked_at=current,
+                from_stage=from_stage,
+                final_stage=from_stage,
+                blocked_at=from_stage,
                 block_reason=(
-                    f"release-in-progress: {stored_version} at {current}"
+                    f"release-in-progress: {stored_version} at {from_stage}"
                 ),
             )
 
-    if current not in chain:
-        # Persisted progress exceeds the requested chain; the real run
-        # performs no rollout calls in this case.
+    if not foreign and STAGE_RANK[stage] >= STAGE_RANK[destination.value]:
+        # This release is already at/beyond the requested destination; the
+        # real run performs no promoting rollout calls (idempotent no-op).
         return StagePlan(
             target=target,
-            from_stage=current,
-            final_stage=current,
+            from_stage=from_stage,
+            final_stage=stage,
             blocked_at=None,
             block_reason="already-beyond-requested-stages",
         )
 
     policy = {k: tuple(v) for k, v in cfg.health_policy.items()}
-    stage = current
-    while stage != chain[-1]:
+    while STAGE_RANK[stage] < STAGE_RANK[destination.value]:
         nxt = NEXT_STAGE[RolloutStage(stage)].value
         healthy, conclusive = policy.get(nxt, _GOOD)
         if healthy and conclusive:
@@ -193,14 +218,14 @@ def _simulate_chain(
         reason = "health-inconclusive" if not conclusive else "health-failed"
         return StagePlan(
             target=target,
-            from_stage=current,
+            from_stage=from_stage,
             final_stage=stage,
             blocked_at=nxt,
             block_reason=f"{reason} at stage {nxt}",
         )
     return StagePlan(
         target=target,
-        from_stage=current,
+        from_stage=from_stage,
         final_stage=stage,
         blocked_at=None,
         block_reason="",
@@ -283,7 +308,7 @@ def plan_pipeline(cfg: PipelineConfig) -> PlanReport:
     elif failure_kind == "partial":
         would_exit = EXIT_BUILD_FAILED
     elif would_error:
-        would_exit = EXIT_WOULD_ERROR
+        would_exit = EXIT_ERROR
     elif deploy_blocked:
         would_exit = EXIT_ROLLOUT_BLOCKED
     else:

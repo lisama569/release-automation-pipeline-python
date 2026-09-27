@@ -114,3 +114,48 @@ def test_plan_enforces_the_same_contracts(tmp_path, git_repo):
         with pytest.raises(InvalidRequestError):
             plan_pipeline(_cfg(tmp_path / "w", git_repo, **bad))
     assert not (tmp_path / "w").exists()
+
+
+@pytest.mark.parametrize(
+    "kwargs,code",
+    [
+        (dict(targets=()), "empty_targets"),
+        (dict(targets=("t1", "t1")), "duplicate_target"),
+        (dict(targets=("t1",), failing_targets=frozenset({"t9"})),
+         "unknown_target"),
+        (dict(stages=()), "empty_stages"),
+        (dict(stages=("staging", "mars")), "unknown_stage"),
+        (dict(stages=("mars",)), "unknown_stage"),
+        (dict(stages=("canary", "staging")), "invalid_stage_sequence"),
+        (dict(stages=("full", "canary")), "invalid_stage_sequence"),
+        (dict(stages=("staging", "staging")), "invalid_stage_sequence"),
+        (dict(health_policy={"mars": (False, True)}), "unknown_stage"),
+    ],
+)
+def test_both_run_and_plan_reject_with_machine_distinguishable_code(
+    tmp_path, git_repo, kwargs, code
+):
+    for op in (run_pipeline, plan_pipeline):
+        work = tmp_path / f"w-{op.__name__}-{code}"
+        with pytest.raises(InvalidRequestError) as exc:
+            op(_cfg(work, git_repo, **kwargs))
+        assert exc.value.code == code, (op.__name__, kwargs, code)
+        # Explicit rejection: no build/deploy and not even a work dir, so a
+        # bad request never silently advances part of the rollout.
+        assert not work.exists(), (op.__name__, kwargs)
+        print(f"\n[test input] {op.__name__} {kwargs} -> rejected {code}")
+
+
+def test_rejected_request_does_not_deploy_any_target(tmp_path, git_repo):
+    # A legal target set paired with an illegal stage sequence must deploy
+    # nothing at all, rather than partially rolling out.
+    work = tmp_path / "w"
+    with pytest.raises(InvalidRequestError) as exc:
+        run_pipeline(_cfg(
+            work, git_repo, targets=("t1", "t2"),
+            stages=("full", "staging"),
+        ))
+    assert exc.value.code == "invalid_stage_sequence"
+    assert not work.exists()
+    assert not (tmp_path / "w").exists()
+
