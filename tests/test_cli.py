@@ -105,6 +105,56 @@ def test_plan_command_rejects_invalid_request(tmp_path, git_repo):
     assert "empty_targets" in err
 
 
+@pytest.mark.parametrize(
+    "stages,error_code",
+    [("", "empty_stages"),
+     ("staging,prod", "unknown_stage"),
+     ("full,staging", "invalid_stage_sequence"),
+     ("canary,canary", "invalid_stage_sequence")],
+)
+def test_run_and_plan_reject_bad_stage_sequences_with_code(
+    tmp_path, git_repo, stages, error_code
+):
+    for cmd in ("run", "plan"):
+        work = tmp_path / (cmd + "_" + error_code + stages.replace(",", "_"))
+        code, _, err = run_cli(
+            cmd, "--repo", str(git_repo), "--work-dir", str(work),
+            "--targets", "t1", "--stages", stages,
+        )
+        assert code == 1, (cmd, stages)
+        assert f"error[{error_code}]" in err, (cmd, stages, err)
+        assert not work.exists(), (cmd, stages)
+
+
+def test_run_rejects_unknown_target_with_code(tmp_path, git_repo):
+    code, _, err = run_cli(
+        "run", "--repo", str(git_repo), "--work-dir", str(tmp_path / "w"),
+        "--targets", "t1", "--fail", "t9",
+    )
+    assert code == 1
+    assert "error[unknown_target]" in err
+    assert not (tmp_path / "w").exists()
+
+
+def test_skipped_stage_sequence_reaches_requested_end_via_cli(
+    tmp_path, git_repo
+):
+    work = tmp_path / "w"
+    code, plan_out, _ = run_cli(
+        "plan", "--repo", str(git_repo), "--work-dir", str(work),
+        "--targets", "t1", "--stages", "staging,full",
+    )
+    assert code == 0
+    assert json.loads(plan_out)["stages"][0]["final_stage"] == "full"
+    code, run_out, _ = run_cli(
+        "run", "--repo", str(git_repo), "--work-dir", str(work),
+        "--targets", "t1", "--stages", "staging,full",
+    )
+    payload = json.loads(run_out)
+    assert code == 0 and payload["exit_code"] == 0
+    assert payload["record"]["stages_final"][0]["final_stage"] == "full"
+
+
 def test_run_writes_record_and_verify_record_roundtrip(tmp_path, git_repo):
     work = tmp_path / "w"
     code, out, _ = run_cli(

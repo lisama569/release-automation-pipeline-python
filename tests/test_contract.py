@@ -51,13 +51,19 @@ def test_non_monotonic_stage_sequence_rejected(tmp_path, git_repo):
 
 
 def test_legal_stage_subsequences_accepted(tmp_path, git_repo):
+    from release_pipeline.state import read_state_readonly
     for good in (("staging",), ("canary",), ("full",),
                  ("staging", "canary"), ("staging", "full"),
                  ("canary", "full"), ("staging", "canary", "full")):
-        r = run_pipeline(_cfg(tmp_path / good[0], git_repo,
-                              targets=("t1",), stages=good))
+        work = tmp_path / good[0]
+        r = run_pipeline(_cfg(work, git_repo, targets=("t1",), stages=good))
         print(f"\n[test input] stages={good} -> exit={r.exit_code}")
         assert r.exit_code == 0
+        # Success means the LAST requested stage was really reached, even
+        # when intermediate stages were skipped.
+        state = read_state_readonly(work / "state" / "t1")
+        assert state["stage"] == good[-1], good
+        assert state["rolled_back"] is False
 
 
 def test_unknown_failing_target_rejected(tmp_path, git_repo):
@@ -104,13 +110,38 @@ def test_partial_failure_is_distinct_from_total_failure(tmp_path, git_repo):
 
 def test_plan_enforces_the_same_contracts(tmp_path, git_repo):
     bad_requests = [
-        dict(targets=()),
-        dict(stages=()),
-        dict(stages=("full", "staging")),
-        dict(stages=("mars",)),
-        dict(targets=("t1",), failing_targets=frozenset({"t2"})),
+        (dict(targets=()), "empty_targets"),
+        (dict(stages=()), "empty_stages"),
+        (dict(stages=("full", "staging")), "invalid_stage_sequence"),
+        (dict(stages=("staging", "staging")), "invalid_stage_sequence"),
+        (dict(stages=("mars",)), "unknown_stage"),
+        (dict(targets=("t1",), failing_targets=frozenset({"t2"})),
+         "unknown_target"),
+        (dict(targets=("t1", "t1")), "duplicate_target"),
     ]
-    for bad in bad_requests:
-        with pytest.raises(InvalidRequestError):
+    for bad, code in bad_requests:
+        with pytest.raises(InvalidRequestError) as exc:
             plan_pipeline(_cfg(tmp_path / "w", git_repo, **bad))
+        assert exc.value.code == code, bad
+    # Every rejection happened before any side effect.
     assert not (tmp_path / "w").exists()
+
+
+def test_real_run_rejects_bad_requests_before_any_side_effect(
+    tmp_path, git_repo
+):
+    """run must not build/deploy/partially advance for a bad request."""
+    cases = [
+        (dict(targets=("t1",), failing_targets=frozenset({"t9"})),
+         "unknown_target"),
+        (dict(stages=("staging", "prod")), "unknown_stage"),
+        (dict(stages=()), "empty_stages"),
+        (dict(stages=("full", "staging")), "invalid_stage_sequence"),
+        (dict(stages=("canary", "canary")), "invalid_stage_sequence"),
+    ]
+    for i, (bad, code) in enumerate(cases):
+        work = tmp_path / f"w{i}"
+        with pytest.raises(InvalidRequestError) as exc:
+            run_pipeline(_cfg(work, git_repo, **bad))
+        assert exc.value.code == code, bad
+        assert not work.exists(), bad

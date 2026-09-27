@@ -17,10 +17,19 @@ rules as :func:`release_pipeline.pipeline.run_pipeline`:
 * per target: ``reuse`` iff the cache probe hits, ``rebuild`` on
   miss/corruption, ``fail`` for targets configured to fail — matching the
   real run's ``cache-hit`` / ``built`` / ``failed`` outcomes;
-* per stage: the rollout chain is simulated with the same health policy and
-  the same persisted starting stage, so ``blocked_at`` / ``block_reason``
-  match the real run's rollback stage and reason;
+* per stage: the rollout is simulated from the persisted starting stage
+  along the canonical chain ``none -> staging -> canary -> full`` until it
+  reaches the LAST requested stage, with the same health policy on every
+  gate (including skipped intermediate stages), so ``from_stage`` /
+  ``final_stage`` / ``blocked_at`` / ``block_reason`` match the real run's
+  actual end stage, rollback gate and reason;
 * the predicted exit code uses the same precedence rules as the real run.
+
+When persisted progress already reached or passed the last requested stage,
+both the plan and the real run are a no-op for that target
+(``blocked_at`` is null). When a different release is mid-flight in the
+persisted state, the plan predicts ``would_exit_code`` 1, matching the
+``release_in_progress`` error the real run raises.
 
 Concurrency
 -----------
@@ -144,8 +153,7 @@ def _plan_stages_for_target(
     """Simulate the rollout chain for one target from persisted state."""
     state = read_state_readonly(state_dir / target)
     current = state.get("stage", RolloutStage.NONE.value)
-    chain = [RolloutStage.NONE.value] + list(cfg.stages)
-    return _simulate_chain(cfg, target, state, current, chain)
+    return _simulate_chain(cfg, target, state, current, cfg.stages[-1])
 
 
 def _simulate_chain(
@@ -153,7 +161,7 @@ def _simulate_chain(
     target: str,
     state: dict,
     current: str,
-    chain: list[str],
+    target_stage: str,
 ) -> StagePlan:
     version = getattr(cfg, "_planned_version", None)
     stored_version = state.get("version")
@@ -171,9 +179,10 @@ def _simulate_chain(
                 ),
             )
 
-    if current not in chain:
-        # Persisted progress exceeds the requested chain; the real run
-        # performs no rollout calls in this case.
+    order = [s.value for s in RolloutStage]  # none < staging < canary < full
+    if current not in order or order.index(current) >= order.index(target_stage):
+        # Persisted progress already reached or passed the last requested
+        # stage; the real run performs no rollout calls in this case.
         return StagePlan(
             target=target,
             from_stage=current,
@@ -184,7 +193,7 @@ def _simulate_chain(
 
     policy = {k: tuple(v) for k, v in cfg.health_policy.items()}
     stage = current
-    while stage != chain[-1]:
+    while stage != target_stage:
         nxt = NEXT_STAGE[RolloutStage(stage)].value
         healthy, conclusive = policy.get(nxt, _GOOD)
         if healthy and conclusive:

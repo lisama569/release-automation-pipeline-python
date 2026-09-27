@@ -12,6 +12,7 @@ import pytest
 from release_pipeline.errors import InvalidRequestError
 from release_pipeline.pipeline import PipelineConfig, run_pipeline
 from release_pipeline.plan import plan_pipeline
+from release_pipeline.state import read_state_readonly
 
 pytestmark = pytest.mark.logging_inputs
 
@@ -137,6 +138,27 @@ def test_plan_matches_run_happy_path_stage_end_state(tmp_path, git_repo):
     assert plan.stages[0].final_stage == "full"
     assert plan.stages[0].blocked_at is None
     assert plan.would_exit_code == result.exit_code == 0
+    # The real run must actually reach the requested final stage (this used
+    # to stop at canary while the plan predicted full).
+    state = read_state_readonly(work / "state" / "t1")
+    assert state["stage"] == "full"
+    assert state["rolled_back"] is False
+    assert not [d for d in result.deploys if d.rolled_back]
+    last_deploy = result.deploys[-1]
+    assert last_deploy.stage.value == "full"
+    assert last_deploy.reason == "advanced-to-full"
+
+
+def test_plan_single_canary_request_really_reaches_canary(tmp_path, git_repo):
+    """A single-stage request ("canary",) must reach canary, not staging."""
+    work = tmp_path / "w"
+    kwargs = dict(targets=("t1",), stages=("canary",))
+    plan = plan_pipeline(_cfg(work, git_repo, **kwargs))
+    result = run_pipeline(_cfg(work, git_repo, **kwargs))
+    assert plan.stages[0].final_stage == "canary"
+    state = read_state_readonly(work / "state" / "t1")
+    assert state["stage"] == "canary"
+    assert result.exit_code == plan.would_exit_code == 0
 
 
 def test_plan_inconclusive_health_matches_rollback(tmp_path, git_repo):

@@ -10,10 +10,20 @@ cache decisions and identical verdicts.
 
 Exit codes
 ----------
-0  all targets built and every configured stage advanced
+0  all targets built and every target reached the LAST requested stage
 2  some (but not all) build targets failed (others may still be deployed)
 3  a rollout stage was blocked and rolled back
 4  every requested build target failed
+
+Stage progression
+-----------------
+The requested stage sequence (e.g. ``("staging", "full")``) may skip
+intermediate stages, but the rollout itself advances along the canonical
+chain ``none -> staging -> canary -> full`` one gate at a time until it
+reaches the last requested stage. Skipped intermediate stages still enforce
+their health gates; an unhealthy or inconclusive gate stops the rollout at
+that point and rolls back. Success (exit 0) is therefore impossible before
+the requested final stage is actually reached.
 """
 
 from __future__ import annotations
@@ -48,6 +58,16 @@ EXIT_OK = 0
 EXIT_BUILD_FAILED = 2
 EXIT_ROLLOUT_BLOCKED = 3
 EXIT_BUILD_FAILED_ALL = 4
+
+# Canonical rollout order; a run advances along this chain until it reaches
+# the LAST requested stage, passing every health gate in between — requested
+# sequences may skip intermediate stages, the rollout itself may not.
+_STAGE_RANK: dict[RolloutStage, int] = {
+    RolloutStage.NONE: 0,
+    RolloutStage.STAGING: 1,
+    RolloutStage.CANARY: 2,
+    RolloutStage.FULL: 3,
+}
 
 
 @dataclass
@@ -169,10 +189,12 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
             env_root / target_name,
             health_by_stage=dict(cfg.health_policy),
         )
-        # Advance through exactly the configured number of stages.
-        chain = [RolloutStage.NONE] + [RolloutStage(s) for s in cfg.stages]
+        # Advance along the canonical chain until the LAST requested stage
+        # is reached; intermediate stages (requested or not) each get their
+        # health gate. A run must never report success before reaching it.
+        target_stage = RolloutStage(cfg.stages[-1])
         current = _current_stage(store)
-        while current in chain and current != chain[-1]:
+        while _STAGE_RANK[current] < _STAGE_RANK[target_stage]:
             dr = rollout(env, result.artifact, version.version, store)
             deploys.append(dr)
             if dr.rolled_back:

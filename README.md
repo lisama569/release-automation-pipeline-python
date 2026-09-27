@@ -40,14 +40,14 @@ python -m release_pipeline verify-parity --mode local
 测试：
 
 ```bash
-pytest -q          # 84 个用例，全部在本地临时目录执行
+pytest -q          # 125 个用例，全部在本地临时目录执行
 ```
 
 ## 退出状态码（CLI 与编排层一致）
 
 | 码 | 含义 |
 |----|------|
-| 0  | 所有目标构建成功，且所有阶段推进成功 |
+| 0  | 所有目标构建成功，且每个目标都**真实到达请求的最后一个阶段**（跳过中间阶段的请求也一样） |
 | 2  | 部分（非全部）构建目标失败（其他目标可能已成功并上线） |
 | 3  | 某上线阶段健康门禁未通过并已回滚 |
 | 4  | 全部构建目标失败（与部分失败明确区分，不合并为同一结论） |
@@ -111,6 +111,17 @@ format(缓存格式版本) · target · version · source_tree_hash
 ```
 
 * **阶段链**：`none → staging → canary → full`，每次调用只推进一阶段。
+* **阶段序列的语义（已修复）**：`--stages` 可以是这条链的任意严格递增
+  子序列（如 `staging,full`、`canary`），**序列里最后一个阶段就是本次
+  必须到达的终点**。真实执行始终沿规范链逐关卡推进，直到到达该终点：
+  - 请求跳过的中间阶段**并不会被跳过健康门禁**。例如
+    `staging,full` 会依次过 staging、canary、full 三关，任何一关不健康
+    或结论不明确，就停在那一关、回滚并以退出码 3 结束；
+  - **不可能在未到达请求终点时报成功**：退出码 0 只意味着每个目标的
+    持久化状态确实到了序列的最后一个阶段；
+  - 持久化进度已经到达或超过请求终点时（如已在 full 却只请求
+    `staging`），预演与真实执行对该目标都不做任何推进（no-op，
+    `blocked_at` 为 `null`）。
 * **健康门禁**：只有 `healthy=true 且 conclusive=true` 才推进。
   - 不健康 → 回滚；
   - **健康结论不明确（inconclusive）同样按失败处理并回滚**，绝不带着
@@ -165,10 +176,30 @@ format(缓存格式版本) · target · version · source_tree_hash
 * **逐目标**：`reuse`（缓存命中，将复用产物）/ `rebuild`（缓存缺失或
   损坏，将重新构建）/ `fail`（目标被配置为失败），附缓存键与缓存状态
   （`hit` / `miss` / `corrupted`）；
-* **逐阶段**：从持久化状态出发模拟阶段链，给出 `from_stage`、
+* **逐阶段**：从持久化状态出发，沿规范链 `none → staging → canary →
+  full` 逐关卡模拟到**请求序列的最后一个阶段**，给出 `from_stage`、
   `final_stage`，以及会在哪一步被拦下（`blocked_at`）与原因
-  （`health-failed` / `health-inconclusive` / `release-in-progress`）；
-* **总体**：`would_exit_code` 使用与真实执行相同的优先级规则。
+  （`health-failed` / `health-inconclusive` / `release-in-progress`）。
+  被请求跳过的中间关卡同样参与模拟；已到达/超过请求终点时为 no-op，
+  `blocked_at` 为 `null`、`block_reason` 为
+  `already-beyond-requested-stages`；
+* **总体**：`would_exit_code` 使用与真实执行相同的优先级规则
+  （全失败 4 > 部分失败 2 > 状态冲突 1 > 上线被拦 3 > 成功 0）。
+
+**怎么解读预演结论与真实执行的一致性**：同一组输入、紧接着执行一次
+真实运行，逐项应当完全相同：
+
+* 逐目标：预演 `reuse/rebuild/fail` ↔ 真实结果的
+  `cache-hit/built/failed`；
+* 逐阶段：预演 `from_stage/final_stage` ↔ 持久化状态的起始/最终阶段；
+  `blocked_at` 非空 ↔ 真实回滚就发生在同一关卡；`block_reason` 的原因
+  类别（`health-failed` / `health-inconclusive`）也一致；
+* 退出码：`would_exit_code` ↔ `exit_code`。
+
+也就是说：**预演说能到哪，真实执行就一定到哪；预演说被哪一关拦下，
+真实执行也一定被同一关卡拦下。** 这些对应关系由
+`tests/test_stage_parity.py` 对全部合法阶段子序列 × 健康策略组合逐项
+参数化断言。
 
 保证：
 
@@ -176,8 +207,8 @@ format(缓存格式版本) · target · version · source_tree_hash
   缓存、不改状态、不动可见符号链接、不写记录；即使中途出错也不留
   半成品。缓存探测是只读的，**不会**像真实读取那样逐出损坏条目。
 * **与执行一致**：同一组输入下，预演的复用/重建结论对应真实执行的
-  `cache-hit`/`built`，拦截阶段与原因对应真实执行的回滚；有测试逐项
-  断言。
+  `cache-hit`/`built`，最终阶段、拦截关卡与原因类别对应真实执行的
+  最终状态与回滚；有测试逐项断言（见上）。
 * **并发安全**：所有被读对象（缓存条目、状态文件、符号链接）都以原子
   rename 发布，预演与其他执行并发时读到的是一致快照，既不破坏共享
   状态，也不会被带偏。
@@ -241,8 +272,10 @@ release_pipeline/
   pipeline.py     端到端编排与退出码
   cli.py          命令行（version/build/run/plan/verify-record/
                   diff-records/verify-parity）
-tests/            84 个用例：重复执行、缓存失效、部分/全部失败、回滚、
-                  并发、预演零痕迹与一致性、记录确定性与可比较性等
+tests/            125 个用例：重复执行、缓存失效、部分/全部失败、回滚、
+                  并发、预演零痕迹与一致性、跳过中间阶段时预演/真实执行
+                  逐项一致（最终阶段、拦截关卡、原因类别、退出码）、
+                  非法请求明确拒绝等
 ```
 
 ## 本地手工验证建议
@@ -276,6 +309,25 @@ test ! -e /tmp/w6 && echo "zero trace"
 # 7) 预演与真实执行结论一致（先预演再执行，比对 would_exit_code）
 python -m release_pipeline plan --repo . --work-dir /tmp/w7 | jq .would_exit_code
 python -m release_pipeline run  --repo . --work-dir /tmp/w7 | jq .exit_code
+
+# 7b) 跳过中间阶段：预演与真实执行都必须到达 full（逐阶段逐项一致）
+python -m release_pipeline plan --repo . --work-dir /tmp/w7b \
+    --targets t1 --stages staging,full | jq '.stages[0] | {from_stage,final_stage,blocked_at}, .would_exit_code'
+python -m release_pipeline run  --repo . --work-dir /tmp/w7b \
+    --targets t1 --stages staging,full | jq '.record.stages_final[0], .exit_code'
+# 被跳过的 canary 关卡照样生效：下面应被 canary 拦下、回滚、退出码均为 3
+echo '{"canary":[false,true]}' > /tmp/h-canary.json
+python -m release_pipeline plan --repo . --work-dir /tmp/w7c \
+    --targets t1 --stages staging,full --health-file /tmp/h-canary.json \
+    | jq '.stages[0] | {final_stage,blocked_at}, .would_exit_code'
+python -m release_pipeline run  --repo . --work-dir /tmp/w7c \
+    --targets t1 --stages staging,full --health-file /tmp/h-canary.json \
+    | jq '.exit_code'
+
+# 7c) 非法请求被明确拒绝（退出码 1，错误码可机器区分，且不留任何目录）
+python -m release_pipeline run  --repo . --stages ""            # error[empty_stages]
+python -m release_pipeline run  --repo . --stages mars          # error[unknown_stage]
+python -m release_pipeline plan --repo . --stages full,staging  # error[invalid_stage_sequence]
 
 # 8) 发布记录：重复执行逐字节一致；比较不同输入的两份记录
 python -m release_pipeline run --repo . --work-dir /tmp/w8 >/dev/null
